@@ -1,6 +1,13 @@
 /// 文本处理：流式切句 + TTS 前的清洗
 use tracing::warn;
 
+/// 用户主动结束会话的说法（整句匹配，标点忽略）
+pub fn is_exit(text: &str) -> bool {
+    const EXIT: [&str; 4] = ["退下", "退下吧", "再见", "拜拜"];
+    let t = text.trim().trim_end_matches(['。', '！', '？', '!', '?', '.', '，', ',', ' ']);
+    EXIT.contains(&t)
+}
+
 /// 按中文标点切句，用于边生成边合成
 pub fn split_sentences(buf: &mut String, force: bool) -> Vec<String> {
     const ENDS: [char; 8] = ['。', '！', '？', '!', '?', '；', ';', '\n'];
@@ -60,4 +67,18 @@ pub fn clean_for_tts(text: &str) -> String {
 fn is_emoji(c: char) -> bool {
     let cp = c as u32;
     (0x1F300..=0x1FAFF).contains(&cp) || (0x2600..=0x27BF).contains(&cp) || (0xFE00..=0xFE0F).contains(&cp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_phrases() {
+        assert!(is_exit("退下"));
+        assert!(is_exit(" 再见。 "));
+        assert!(is_exit("拜拜！"));
+        assert!(!is_exit("再见一次"));
+        assert!(!is_exit("今天天气怎么样"));
+    }
 }

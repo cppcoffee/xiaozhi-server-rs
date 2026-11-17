@@ -141,6 +141,18 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                     shared.send_tts_state("stop", None).await;
                     continue;
                 }
+                if crate::text::is_exit(&text) {
+                    // 用户结束会话：回显识别文本、通知 goodbye、断开连接
+                    info!("[{}] 用户结束会话: {text}", shared.device_id);
+                    shared
+                        .send_json(crate::protocol::stt_text(&text, &shared.session_id))
+                        .await;
+                    shared
+                        .send_json(json!({"type": "goodbye", "session_id": shared.session_id}))
+                        .await;
+                    let _ = shared.ws_tx.send(Message::Close(None)).await;
+                    continue;
+                }
                 if let Err(e) = run_turn(&shared, &tts, text).await {
                     error!("回合处理失败: {e}");
                 }
