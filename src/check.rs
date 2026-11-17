@@ -38,9 +38,9 @@ pub async fn run(cfg: &Config) -> bool {
 
     println!();
     if ok {
-        println!("全部通过，可以启动服务：{} config.yaml", env!("CARGO_PKG_NAME"));
+        println!("全部通过，可以启动服务：{} config.toml", env!("CARGO_PKG_NAME"));
     } else {
-        println!("有失败项，按上面提示修正 config.yaml 后重试");
+        println!("有失败项，按上面提示修正 config.toml 后重试");
     }
     ok
 }

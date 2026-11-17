@@ -356,7 +356,7 @@ pub async fn run_asr(
 /// `--check` 用：只做握手 + 初始化，验证 appid/token/resource_id 是否匹配
 pub async fn probe(cfg: &crate::config::AsrCfg, sample_rate: u32) -> Result<String> {
     if cfg.appid.contains("你的") || cfg.access_token.contains("你的") {
-        return Err(anyhow!("asr.appid / asr.access_token 还是占位符（config.yaml 第 56–57 行）"));
+        return Err(anyhow!("asr.appid / asr.access_token 还是占位符（请检查 config.toml 的 [asr]）"));
     }
     let mut asr = DoubaoAsr::new(cfg.clone(), sample_rate);
     asr.connect().await?;

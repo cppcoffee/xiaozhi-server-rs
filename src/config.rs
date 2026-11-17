@@ -19,7 +19,7 @@ pub struct Config {
     pub tts: TtsCfg,
 }
 
-fn d_port() -> u16 {
+fn d_ws_port() -> u16 {
     8000
 }
 fn d_http_port() -> u16 {
@@ -28,8 +28,8 @@ fn d_http_port() -> u16 {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerCfg {
-    #[serde(default = "d_port")]
-    pub port: u16,
+    #[serde(default = "d_ws_port", alias = "port")]
+    pub ws_port: u16,
     #[serde(default = "d_http_port")]
     pub http_port: u16,
 }
@@ -37,7 +37,7 @@ pub struct ServerCfg {
 impl Default for ServerCfg {
     fn default() -> Self {
         Self {
-            port: d_port(),
+            ws_port: d_ws_port(),
             http_port: d_http_port(),
         }
     }
@@ -168,7 +168,7 @@ pub struct TtsCfg {
 
 impl Config {
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        Ok(serde_yaml::from_str(text)?)
+        Ok(toml::from_str(text)?)
     }
 
     pub fn load(path: &str) -> anyhow::Result<Self> {
@@ -216,12 +216,85 @@ impl ConfigStore {
         self.cfg.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// 先写临时文件再改名，避免把正在用的 config.yaml 写坏
+    /// 先写临时文件再改名，避免把正在用的 config.toml 写坏
     pub fn replace(&self, text: &str, next: Config) -> anyhow::Result<()> {
         let tmp = format!("{}.tmp", self.path);
         std::fs::write(&tmp, text)?;
         std::fs::rename(&tmp, &self.path)?;
         *self.cfg.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL: &str = r#"
+[llm]
+api_key = "test-key"
+model = "test-model"
+[asr]
+appid = "test-asr"
+access_token = "test-asr-token"
+[tts]
+appid = "test-tts"
+access_token = "test-tts-token"
+voice = "test-voice"
+"#;
+
+    #[test]
+    fn example_toml_parses() {
+        let cfg = Config::parse(include_str!("../config.toml")).unwrap();
+        assert_eq!(cfg.server.ws_port, 8000);
+        assert_eq!(cfg.server.http_port, 8003);
+        assert_eq!(cfg.vad.rms_threshold, 500.0);
+        assert!(cfg.llm.prompt.contains("你是一个名叫小智的智能助手"));
+        assert!(cfg.llm.prompt.ends_with('\n'));
+    }
+
+    #[test]
+    fn minimal_toml_uses_defaults() {
+        let cfg = Config::parse(MINIMAL).unwrap();
+        assert_eq!(cfg.server.ws_port, 8000);
+        assert_eq!(cfg.server.http_port, 8003);
+        assert_eq!(cfg.log.level, "info");
+        assert_eq!(cfg.log.keep, 2);
+        assert_eq!(cfg.vad.rms_threshold, 500.0);
+        assert_eq!(cfg.vad.start_frames, 2);
+        assert_eq!(cfg.vad.end_frames, 6);
+        assert_eq!(cfg.llm.base_url, d_llm_url());
+        assert!(cfg.llm.prompt.is_empty());
+        assert_eq!(cfg.asr.ws_url, d_asr_url());
+        assert_eq!(cfg.asr.resource_id, d_asr_resource());
+        assert_eq!(cfg.tts.api_url, d_tts_url());
+        assert_eq!(cfg.tts.cluster, "volcano_tts");
+    }
+
+    #[test]
+    fn explicit_server_ports_are_independent() {
+        let cfg = Config::parse(&format!(
+            "[server]\nws_port = 9000\nhttp_port = 9003\n{MINIMAL}"
+        ))
+        .unwrap();
+        assert_eq!(cfg.server.ws_port, 9000);
+        assert_eq!(cfg.server.http_port, 9003);
+    }
+
+    #[test]
+    fn legacy_port_name_is_still_accepted() {
+        let cfg = Config::parse(&format!("[server]\nport = 9000\n{MINIMAL}")).unwrap();
+        assert_eq!(cfg.server.ws_port, 9000);
+        assert!(
+            Config::parse(&format!("[server]\nport = 9000\nws_port = 9001\n{MINIMAL}")).is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_configs_are_rejected() {
+        assert!(Config::parse("[llm").is_err());
+        assert!(Config::parse("[server]\nport = 8000").is_err());
+        assert!(Config::parse("llm:\n  api_key: test").is_err());
+        assert!(Config::parse(&format!("[server]\nport = \"invalid\"\n{MINIMAL}")).is_err());
     }
 }

@@ -34,7 +34,7 @@ fn ws_url(cfg: &Config, host: Option<&str>) -> String {
         Some(h) => h.to_string(),
         None => local_ip(),
     };
-    format!("ws://{host}:{}/xiaozhi/v1/", cfg.server.port)
+    format!("ws://{host}:{}/xiaozhi/v1/", cfg.server.ws_port)
 }
 
 /// Host 头去掉端口；IPv6 保留方括号
@@ -57,6 +57,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ota_uses_configured_websocket_port() {
+        let mut cfg = Config::parse(include_str!("../config.toml")).unwrap();
+        cfg.server.ws_port = 9000;
+        cfg.server.http_port = 9003;
+        let info = response(&cfg, "1.0.0", Some("192.168.1.100:9003"));
+        assert_eq!(
+            info["websocket"]["url"],
+            "ws://192.168.1.100:9000/xiaozhi/v1/"
+        );
+    }
+
+    #[test]
     fn host_without_port() {
         assert_eq!(bare_host("192.168.1.100:8003"), Some("192.168.1.100"));
         assert_eq!(bare_host("192.168.1.100"), Some("192.168.1.100"));
@@ -66,7 +78,11 @@ mod tests {
 }
 
 /// OTA 接口：设备从这里拿 websocket 地址和对时
-pub async fn handler(State(state): State<Arc<ConfigStore>>, headers: HeaderMap, body: String) -> Json<Value> {
+pub async fn handler(
+    State(state): State<Arc<ConfigStore>>,
+    headers: HeaderMap,
+    body: String,
+) -> Json<Value> {
     let cfg = state.current();
     let device_id = headers
         .get("device-id")
@@ -80,7 +96,12 @@ pub async fn handler(State(state): State<Arc<ConfigStore>>, headers: HeaderMap, 
 
     let version = ["device-version", "firmware-version", "application-version"]
         .iter()
-        .find_map(|h| headers.get(*h).and_then(|v| v.to_str().ok()).map(String::from))
+        .find_map(|h| {
+            headers
+                .get(*h)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        })
         .or_else(|| {
             body_json
                 .get("application")

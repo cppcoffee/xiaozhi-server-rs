@@ -4,6 +4,7 @@ mod check;
 mod config;
 mod llm;
 mod logging;
+mod mcp;
 mod ota;
 mod protocol;
 mod session;
@@ -24,7 +25,7 @@ use config::{Config, ConfigStore};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 参数：可选 config 路径 + --check（只校验凭证，不启动服务）
-    let mut path = "config.yaml".to_string();
+    let mut path = "config.toml".to_string();
     let mut do_check = false;
     for a in std::env::args().skip(1) {
         if a == "--check" {
@@ -42,14 +43,14 @@ async fn main() -> anyhow::Result<()> {
     }
     info!(
         "小智 Rust Server 启动：ws={} http={} llm={} asr={} tts={}",
-        cfg.server.port,
+        cfg.server.ws_port,
         cfg.server.http_port,
         cfg.llm.model,
         cfg.asr.resource_id,
         cfg.tts.voice
     );
     if cfg.llm.api_key.contains("你的") {
-        warn!("config.yaml 里 llm.api_key 还是占位符，请填入火山方舟 API Key");
+        warn!("config.toml 里 llm.api_key 还是占位符，请填入火山方舟 API Key");
     }
 
     let state = Arc::new(ConfigStore::new(path, (*cfg).clone()));
@@ -62,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(|| async { "xiaozhi rust server ok" }))
         .with_state(state.clone());
 
-    let ws_addr = SocketAddr::from(([0, 0, 0, 0], cfg.server.port));
+    let ws_addr = SocketAddr::from(([0, 0, 0, 0], cfg.server.ws_port));
     let http_addr = SocketAddr::from(([0, 0, 0, 0], cfg.server.http_port));
 
     let ws_app = app.clone();
@@ -78,3 +79,7 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, ws_app).await?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/support/device_tools.rs"]
+mod device_tools;
