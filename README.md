@@ -21,7 +21,7 @@
 | LLM | ✅ | 火山方舟 Ark（OpenAI 兼容，SSE 流式） |
 | TTS | ✅ | 豆包语音合成 HTTP v1（整句返回，`pcm`/`wav` 自动处理） |
 | 上下文 | ✅ | 保留最近 6 个完整回合（含 assistant tool_calls / tool results）；取消回合不写历史 |
-| 设备 MCP + LLM tool calling | ✅ | `rmcp` 客户端，严格只开放时间 / 缓存天气 / 本地传感器三个只读工具；见第 8 节 |
+| 设备 MCP + LLM tool calling | ✅ | `rmcp` 客户端；时间/缓存天气/本地传感器三个只读读数工具固定 schema + 硬兜底，其余设备标准工具（音量/亮度/主题/拍照/板级动作）透传；见第 8 节 |
 | IoT 指令 | ❌ 未实现 | 不执行设备任意指令 |
 | 情绪 emoji（`type: llm`） | ❌ 未实现 | 需要的话在 `run_turn` 里补一条消息即可 |
 | 双向流式 TTS | ❌ 未实现 | 当前是 HTTP 整句合成（S 档），延迟略高于流式 |
@@ -116,7 +116,7 @@ cargo test
 | `src/vad.rs` | 能量门限 VAD | `core/providers/vad/silero.py`（改为无模型方案） |
 | `src/asr.rs` | 豆包流式 ASR v3 二进制帧 | `core/providers/asr/doubao_stream.py` |
 | `src/llm.rs` | OpenAI-compatible SSE、工具增量解析、ID 校验与有界调用循环；返回最终文本和完整历史 | `core/providers/llm/openai/*` |
-| `src/mcp.rs` | rmcp 客户端、XiaoZhi envelope、发现/白名单/只读校验；`ToolTurn` 集中固定提示、不可用兜底及缓存警告 | — |
+| `src/mcp.rs` | rmcp 客户端、XiaoZhi envelope、发现/工具开放规则/读数校验；`ToolTurn` 集中固定提示、不可用兜底及缓存警告 | — |
 | `tests/support/device_tools.rs` | 无云假设备 / 假 LLM / 真实 WS reader 回归（由 main 的测试模块引入） | — |
 | `src/tts.rs` | 豆包 HTTP v1 合成 | `core/providers/tts/doubao.py` |
 
@@ -169,11 +169,13 @@ MCP 复用官方 Rust SDK `rmcp`（Apache-2.0），SSE 帧解析复用 `eventsou
 
 所有上行 WS 消息（包含完整 envelope，不只是 payload）限制为 **64 KiB**，由 axum/tungstenite 在 JSON 解析前执行，分片按重组后的累计长度计算；超限关闭连接。MCP reader 不再为了量长度重新序列化 JSON，也不再先复制整个 `Value` 才交给 rmcp 反序列化。
 
-**SDK 适配评估**：`rmcp::Transport<RoleClient>` 支持独立 send/receive，能直接复用现有 WS writer 队列和有界 reader 转交通道。`serve_with_ct` 提供标准 initialize 生命周期，`list_tools`/`call_tool` 提供请求关联及放弃请求时的取消通知，因此没有降级为自写 JSON-RPC/MCP 实现。局部代码只做 envelope、设备字段校验、分页资源上限和业务白名单。已只读核对当前 ESP 源码：`esp_xiaozhi_mcp.c` 将 manager 响应解析为 payload 对象并附当前 session_id；`esp_mcp_tool.c` 对空 properties 输出 object / additionalProperties=false，且不输出空 required 数组；`esp_mcp_engine.c` 接受 baseline initialize 的 protocolVersion/capabilities/clientInfo 并处理 notifications/initialized。此为源码兼容性核对，不代替实机互通验证。
+**SDK 适配评估**：`rmcp::Transport<RoleClient>` 支持独立 send/receive，能直接复用现有 WS writer 队列和有界 reader 转交通道。`serve_with_ct` 提供标准 initialize 生命周期，`list_tools`/`call_tool` 提供请求关联及放弃请求时的取消通知，因此没有降级为自写 JSON-RPC/MCP 实现。局部代码只做 envelope、设备字段校验、分页资源上限和工具开放规则。已只读核对两份 ESP 源码：`esp_xiaozhi_mcp.c`（自写设备）将 manager 响应解析为 payload 对象并附当前 session_id；`esp_mcp_tool.c` 对空 properties 输出 object / additionalProperties=false，且不输出空 required 数组；上游 `xiaozhi-esp32` 的 `mcp_server.cc` 同样输出空 schema 并支持带参工具。此为源码兼容性核对，不代替实机互通验证。
 
-### 严格白名单与模型别名
+### 工具开放规则与模型别名
 
-仅接受以下三个 MCP 名称；设备多报的工具（包括重启、音量、GPIO 等）一律不向模型开放，也不可执行。设备的工具 description、annotations 和 initialize instructions 均不作为模型提示词/授权依据，使用服务端固定描述。
+设备 `tools/list` 返回的标准工具分两类处理；`withUserTools` 从不请求，所以设备把重启、刷机、截屏上传这类用户权限动作藏在用户工具里，模型看不到也调不到。
+
+1. **只读数据工具**（仅这三个）使用服务端固定描述与固定空参数 schema，设备端 schema 必须精确为下列形式，否则该工具不开放：
 
 | MCP 名称 | OpenAI 函数名 |
 |---|---|
@@ -181,17 +183,21 @@ MCP 复用官方 Rust SDK `rmcp`（Apache-2.0），SSE 帧解析复用 `eventsou
 | `self.get_weather_forecast` | `get_weather_forecast` |
 | `self.get_sensor_reading` | `get_sensor_reading` |
 
-使用别名是因为许多 OpenAI-compatible 提供商不接受函数名中的点；设备端名称不变。每个工具的 `inputSchema` 必须精确为：
-
 ```json
 {"type":"object","properties":{},"additionalProperties":false}
 ```
 
-schema 不符则该工具不开放；重复名称、无效/循环 cursor、发现超时则整次发现失败。执行时仍重新验证白名单和参数，只有 JSON 空对象 `{}` 可用；`null`、空字符串、数组或任何参数键都拒绝。不接受设备自行扩展 schema 或模型自行选择的其他名称。
+使用别名是因为许多 OpenAI-compatible 提供商不接受函数名中的点；设备端名称不变。
 
-### 设备只读结果约定
+2. **其余标准工具**（`self.get_device_status`、`self.audio_speaker.set_volume`、`self.screen.set_brightness`、`self.screen.set_theme`、`self.camera.take_photo`，以及 `self.otto.*` 这类板级动作）按设备声明的 description 与 `inputSchema` 透传。函数名把点号等非法字符换成下划线（`self.audio_speaker.set_volume` → `self_audio_speaker_set_volume`）；超过 64 字节、重名或与只读别名冲突的直接丢弃。schema 必须是 `type: object`，且不加 `strict`（设备生成的 schema 常带可选参数，严格模式会被提供商拒绝）。
 
-工具返回的城市、天气缓存、时间与传感器数据会作为 tool message 上传到配置的 LLM 提供商；这不是纯本地问答。不要在工具结果里混入密码或其他秘密。
+服务端不再维护第二份工具名清单：设备作为标准工具暴露什么，模型就能调什么（`self.reboot` 这类默认藏在用户工具里，只有显式请求 `withUserTools` 才会出现，本服务端从不请求）。重复名称、无效/循环 cursor、发现超时则整次发现失败。
+
+执行时仍按发现结果匹配函数名：只读工具只接受 JSON 空对象 `{}`，`null`、空字符串、数组或任何参数键都拒绝；动作工具接受任意 JSON 对象并原样作为 `arguments` 转发。两者都只接受一个 text content；动作工具的 JSON 结果会被解析，纯文本（如 `true`）按字符串交给模型。动作工具调用失败（包括模型编造的工具名）时用固定文案替换本轮回答，避免模型声称“已完成”。
+
+### 只读工具的返回约定
+
+只读工具返回的城市、天气缓存、时间与传感器数据会作为 tool message 上传到配置的 LLM 提供商；这不是纯本地问答。不要在工具结果里混入密码或其他秘密。
 
 成功返回一个 JSON **文字** content，`isError` 可省略或为 false：
 
@@ -199,7 +205,7 @@ schema 不符则该工具不开放；重复名称、无效/循环 cursor、发�
 {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"synchronized\":false}"}],"isError":false}}
 ```
 
-只接受一个 text content，text 内必须为 JSON object。`isError=true`、RPC error、非 JSON、非 object、字段不完整都作为不可用数据，不制造默认读数。不要返回图片、资源链接或多个文字块。
+只读工具只接受一个 text content，text 内必须为 JSON object。`isError=true`、RPC error、非 JSON、非 object、字段不完整都作为不可用数据，不制造默认读数。不要返回图片、资源链接或多个文字块。
 
 字段约定（字段名区分大小写）：
 

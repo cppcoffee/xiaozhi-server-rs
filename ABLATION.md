@@ -90,3 +90,42 @@
 - `git diff --check` 通过；逐文件确认其他 Rust 源码/测试、Cargo.toml、Cargo.lock、config.toml 与本轮快照逐字节一致；baseline SHA256 验证完整。
 
 测试只使用假设备、回环 HTTP/WS、真实 rmcp 和真实本地音频编解码；没有云凭据测试、ESP32 实机 MCP/WakeNet/I²S 或真实读数验证。不把这些通过写成端到端硬件/云端保证。
+
+## 2026-11-17 第二轮：工具透传后的消融
+
+### 基线与方法
+
+- 本轮对象是“修复 MCP 工具对不上上游 `xiaozhi-esp32`”那次改动：`src/mcp.rs` 575 行、`tests/support/device_tools.rs` 1639 行、57 项测试。改动前的 HEAD 为 `mcp.rs` 465 / 测试 1582 / 56 项。
+- 工作树快照在 `target/ablation2/`（`baseline/`、`mcp.final.rs`）；每个变体都从同一 575 行基线独立删减，`cargo test` 全量跑，不累加。
+- 判断口径沿用上一轮：**删了测试还过 ≠ 一定要删**。只有当删除不改变已声明的行为、或删除本身就是目的时才移除；删除会让整轮对话失败（而不是单个工具失败）的校验保留并在表中写明。
+
+### 独立删除实验
+
+| 候选 | `mcp.rs` 575 → | 测试 | 决定 / 依据 |
+|---|---:|---|---|
+| `MAX_TOOLS = 32` + `tools.truncate` | 572 | 57 / 0 failed | **移除**。无测试覆盖；真实设备暴露 ≤10 个工具；同样的“无限增长”论点对工具 description 并不设限，属推测性防御 |
+| `Ok(data) if !reading` 分支 | 573 | 57 / 0 failed | **移除**。动作结果本来就落到 `match alias` 的 `_ => {}`，返回值逐字节相同，是纯冗余 guard |
+| `complete` 标志 | 570 | 57 / 0 failed | **移除**。恢复 `None => return Ok((service, build_tools(raw)))` 早退；20 页上限仍由循环后的 `bail!` 保证 |
+| `DENIED` 4 个名字 | 566 | 56 / 1 failed | **移除**。3 个是 `AddUserOnlyTool` 注册的用户权限工具，服务端从不请求 `withUserTools`，无论如何都看不到；第 4 个覆盖了板子自己“让 AI 可调”的注册意图。更关键的是它与本次 bug 同源——服务端维护第二份工具名清单。测试改为断言真正的那道门：`tools/list` 不带 `withUserTools` |
+| 动作失败复用读数失败文案 | 556 | 56 / 1 failed | **保留**。`llm_unknown_tool_never_reaches_device` 断言动作/未知工具失败必须说“这个操作没有执行成功”，不能对用户说“读取失败” |
+| `alias_for` 长度/首字符检查 | — | 57 / 0 failed | **保留（判断项）**。删了测试照样过；但一个超过 64 字节或首字符非法的工具名会让**每次** LLM 请求被提供商 400 拒绝，整轮对话失败。代价 1 行 |
+| 动作工具 schema `type=object` 检查 | — | 57 / 0 failed | **保留（判断项）**。同上：非法 schema 会让整份 `tools` 数组被拒绝，不是只丢一个工具 |
+
+### 结果
+
+| 文件 | HEAD | 首次修复 | 消融后 | 消融净减 |
+|---|---:|---:|---:|---:|
+| `src/mcp.rs` | 465 | 575 | 556 | −19 |
+| `tests/support/device_tools.rs` | 1582 | 1639 | 1632 | −7 |
+| `README.md` | 279 | 285 | 285 | 0（正文替换，行数不变） |
+| 测试数 | 56 | 57 | 57 | 0 |
+
+- 首次修复净增 110 行生产代码，其中 18 行是推测性防御/冗余分支，已删除；剩下的是 `ToolSpec`、`build_tools`、别名推导、`call` 的参数/结果分支。
+- 行为没有因为消融而放宽：三个只读工具仍要求精确空 schema、执行时只接受 `{}`、读数仍需 `validate_reading`；64 KiB 上行上限、8s RPC / 20s discovery、4 次工具往返、65/75/180s 预算均未改。
+
+### 验证
+
+- `cargo test --locked`：**57/57**；`cargo build --locked` 成功。
+- `cargo clippy --locked --all-targets -- -D warnings -A clippy::items_after_test_module`：成功（豁免项与上一轮相同，仍是 `ota.rs` 的既有 lint）。
+- `git diff --check` 通过。
+- 仍然只有假设备 + 回环 HTTP/WS，没有上游 `xiaozhi-esp32` 实机、真实模型 tool_calls 或豆包云端验证。删除 `DENIED` 意味着：设备作为标准工具暴露什么，模型就能调什么；`self.reboot` 等是否可调由设备自己的 `AddUserOnlyTool` 决定。
