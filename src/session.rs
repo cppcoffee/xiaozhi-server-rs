@@ -25,6 +25,9 @@ use crate::vad::{EnergyVad, VadEvent};
 /// 保留最近多少轮对话上下文
 const HISTORY_ROUNDS: usize = 6;
 
+/// 多久没有任何消息就断开这条连接（设备待机时只有唤醒才发消息）
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub struct Shared {
     pub cfg: Arc<Config>,
     pub ws_tx: mpsc::Sender<Message>,
@@ -157,13 +160,24 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
     let mut manual_mode = false;
     let mut flushing = false;
 
-    while let Some(msg) = stream.next().await {
+    loop {
+        let msg = tokio::select! {
+            msg = stream.next() => msg,
+            _ = tokio::time::sleep(IDLE_TIMEOUT) => {
+                if shared.turn_cancel.lock().await.is_some() {
+                    continue; // 正在回话，不算空闲
+                }
+                info!("空闲 {}s，关闭连接回收资源", IDLE_TIMEOUT.as_secs());
+                break;
+            }
+        };
         let msg = match msg {
-            Ok(m) => m,
-            Err(e) => {
+            Some(Ok(m)) => m,
+            Some(Err(e)) => {
                 warn!("websocket 读错误: {e}");
                 break;
             }
+            None => break,
         };
         match msg {
             Message::Text(t) => {
