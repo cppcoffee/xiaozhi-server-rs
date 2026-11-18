@@ -1118,7 +1118,7 @@ fn start_turn(shared: &Arc<crate::session::Shared>) -> tokio::task::JoinHandle<a
     let shared = shared.clone();
     tokio::spawn(async move {
         let tts = crate::tts::DoubaoTts::new(shared.cfg.tts.clone());
-        crate::session::run_turn(&shared, &tts, "请读取设备时间".into()).await
+        crate::session::run_turn(&shared, &tts, "请读取设备时间".into(), CancellationToken::new()).await
     })
 }
 async fn turn_audio(output: &mut mpsc::Receiver<Message>) -> Vec<Value> {
@@ -1629,4 +1629,133 @@ async fn mixed_available_and_unavailable_readings_keep_the_conservative_fallback
     // Available data is not discarded from the model transcript/history.
     let sensor_data: Value = serde_json::from_str(history[1]["content"].as_str().unwrap()).unwrap();
     assert_eq!(sensor_data["data"]["temperature_c"], 23.5);
+}
+
+#[tokio::test]
+async fn two_opus_questions_reuse_context_and_end_the_session_once() {
+    let (cloud, fake) = llm_server(vec![
+        answer_sse("今天带伞。"),
+        answer_sse("明天不需要。"),
+    ])
+    .await;
+    fake.audio_frames.store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut config = cfg(&cloud.url);
+    config.tts.api_url = format!("{}/tts", cloud.url);
+    let (observed_tx, mut observed) = mpsc::unbounded_channel();
+    let asr_count = Arc::new(AtomicUsize::new(0));
+    let asr = serve(Router::new().route(
+        "/asr",
+        get(move |upgrade: axum::extract::ws::WebSocketUpgrade| {
+            let index = asr_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let observed_tx = observed_tx.clone();
+            async move {
+                upgrade.on_upgrade(move |mut socket| async move {
+                    if !matches!(socket.recv().await, Some(Ok(Message::Binary(_)))) {
+                        return;
+                    }
+                    let response = |json: Value| {
+                        let body = json.to_string().into_bytes();
+                        let mut bytes = vec![0x11, 0x90, 0x10, 0, 0, 0, 0, 0];
+                        bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
+                        bytes.extend_from_slice(&body);
+                        Message::Binary(bytes.into())
+                    };
+                    socket.send(response(json!({"code": 0}))).await.unwrap();
+                    let mut pcm_frames = 0;
+                    while let Some(Ok(Message::Binary(bytes))) = socket.recv().await {
+                        if bytes[1] & 0x0f != 0x02 {
+                            pcm_frames += 1;
+                            continue;
+                        }
+                        observed_tx.send((index, pcm_frames)).unwrap();
+                        if index == 0 {
+                            // This old ASR round never supplies a final result. A new listen
+                            // must cancel the flush immediately, without waiting ten seconds.
+                            continue;
+                        }
+                        let text = ["unused", "今天要带伞吗？", "明天呢？", "退下"][index];
+                        let _ = socket.send(response(json!({
+                            "result": {"utterances": [{"definite": true, "text": text}]}
+                        }))).await;
+                    }
+                })
+            }
+        }),
+    )).await;
+    config.asr.ws_url = asr.url.replace("http://", "ws://") + "/asr";
+    let device = serve(
+        Router::new()
+            .route("/ws", get(crate::session::ws_handler))
+            .with_state(Arc::new(ConfigStore::new("unused-test-config.toml".into(), config))),
+    ).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(device.url.replace("http://", "ws://") + "/ws")
+        .await
+        .unwrap();
+    let session_id = ws_handshake(&mut ws).await;
+
+    async fn question(ws: &mut Ws, force_stop: bool) {
+        ws_send(ws, json!({"type":"listen","state":"start","mode":"auto"})).await;
+        let mut enc = crate::audio::OpusOut::new(16_000, 60).unwrap();
+        let mut samples: Vec<i16> = (0..(960 * 4))
+            .map(|i| ((i as f32 * 0.18).sin() * 9000.0) as i16)
+            .collect();
+        if !force_stop {
+            samples.resize(960 * 15, 0);
+        }
+        for packet in enc.encode(&samples) {
+            ws.send(tokio_tungstenite::tungstenite::Message::Binary(packet.into())).await.unwrap();
+        }
+        // VAD and duplicate wire stops may race, but only one can finalize the round.
+        ws_send(ws, json!({"type":"listen","state":"stop"})).await;
+        ws_send(ws, json!({"type":"listen","state":"stop"})).await;
+    }
+
+    question(&mut ws, true).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), observed.recv()).await.unwrap().unwrap().0,
+        0,
+    );
+
+    for (index, expected) in [(1, "今天要带伞吗？"), (2, "明天呢？")] {
+        question(&mut ws, index == 2).await;
+        let (actual, frames) = tokio::time::timeout(Duration::from_secs(2), observed.recv())
+            .await.unwrap().unwrap();
+        assert_eq!(actual, index);
+        assert!(frames >= 4, "initial voiced frames should reach ASR");
+        let (mut stt, mut starts, mut audio) = (false, 0, 0);
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(2), ws.next())
+                .await.unwrap().unwrap().unwrap();
+            match message {
+                tokio_tungstenite::tungstenite::Message::Binary(_) => audio += 1,
+                tokio_tungstenite::tungstenite::Message::Text(text) => {
+                    let msg: Value = serde_json::from_str(&text).unwrap();
+                    if msg["type"] == "stt" {
+                        assert_eq!(msg["text"], expected);
+                        stt = true;
+                    } else if msg["type"] == "tts" && msg["state"] == "start" {
+                        starts += 1;
+                    } else if msg["type"] == "tts" && msg["state"] == "stop" {
+                        assert!(stt && starts == 1 && audio > 0, "unexpected or duplicate stop in round {index} (stt {stt}, starts {starts}, audio {audio})");
+                        break;
+                    }
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+    }
+    question(&mut ws, true).await;
+    let exit_text = ws_recv(&mut ws).await;
+    assert_eq!(exit_text["text"], "退下");
+    let goodbye = ws_recv(&mut ws).await;
+    assert_eq!(goodbye["type"], "goodbye");
+    assert_eq!(goodbye["session_id"], session_id);
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), ws.next()).await.unwrap(),
+        Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))
+    ));
+    let requests = fake.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let history = requests[1]["messages"].as_array().unwrap();
+    assert!(history.iter().any(|msg| msg["role"] == "assistant" && msg["content"] == "今天带伞。"));
 }

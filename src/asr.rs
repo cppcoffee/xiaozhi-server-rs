@@ -9,17 +9,20 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::config::AsrCfg;
 
-/// 供 UI/会话层下发的指令
 #[derive(Debug)]
 pub enum AsrCmd {
-    /// 一帧 PCM16（16k 单声道）
+    Start(CancellationToken),
     Pcm(Vec<i16>),
-    /// 说话结束，通知服务端出最终结果
     Flush,
-    /// 丢弃当前会话（打断时用）
-    Reset,
+}
+
+pub struct AsrOutcome {
+    pub turn: CancellationToken,
+    pub text: String,
 }
 
 const MSG_FULL_CLIENT_REQUEST: u8 = 0x01;
@@ -279,77 +282,93 @@ async fn drain_pending(asr: &mut DoubaoAsr, wait_ms: u64) -> Option<String> {
     }
 }
 
-/// 运行 ASR：接收音频帧 → 吐最终识别文本
+/// Run one cancellable ASR stream per accepted listen start.
 pub async fn run_asr(
     cfg: AsrCfg,
     sample_rate: u32,
     mut rx: mpsc::Receiver<AsrCmd>,
-    out: mpsc::Sender<String>,
-    cancel: tokio_util::sync::CancellationToken,
+    out: mpsc::Sender<AsrOutcome>,
+    cancel: CancellationToken,
 ) {
     let mut asr = DoubaoAsr::new(cfg, sample_rate);
-    let mut waiting_final = false;
-
+    let mut active: Option<CancellationToken> = None;
     loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                asr.close().await;
-                return;
+        let cmd = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = async {
+                match &active {
+                    Some(turn) => turn.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                asr.ws = None;
+                active = None;
+                continue;
             }
-            cmd = rx.recv() => {
-                let Some(cmd) = cmd else { asr.close().await; return; };
-                match cmd {
-                    AsrCmd::Pcm(pcm) => {
-                        if waiting_final { continue; }
-                        if let Err(e) = asr.send_pcm(&pcm).await {
-                            error!("发送 ASR 音频失败: {e}");
-                            asr.close().await;
-                            continue;
-                        }
-                        if let Some(text) = drain_pending(&mut asr, 0).await {
-                            waiting_final = true;
-                            if out.send(text).await.is_err() { return; }
-                        }
-                    }
-                    AsrCmd::Flush => {
-                        if waiting_final {
-                            // 本轮已出结果，为下一句重新建流
-                            asr.close().await;
-                            waiting_final = false;
-                            continue;
-                        }
-                        if let Err(e) = asr.flush().await {
-                            warn!("发送 ASR 结束帧失败: {e}");
-                            asr.close().await;
-                        }
-                        // 等服务端出最终结果
-                        let mut got = None;
-                        for _ in 0..FLUSH_WAIT_STEPS {
-                            if let Some(t) = drain_pending(&mut asr, 100).await {
-                                got = Some(t);
-                                break;
-                            }
-                            if asr.ws.is_none() { break; }
-                        }
-                        waiting_final = true;
-                        match got {
-                            Some(text) => {
-                                if out.send(text).await.is_err() { return; }
-                            }
-                            None => {
-                                // 静音/纯噪声：关流，并给上层一个空回合标记，否则设备一直等
-                                asr.close().await;
-                                if out.send(String::new()).await.is_err() { return; }
-                            }
-                        }
-                    }
-                    AsrCmd::Reset => {
-                        asr.close().await;
-                        waiting_final = false;
-                    }
+            cmd = rx.recv() => match cmd { Some(cmd) => cmd, None => break },
+        };
+        if let AsrCmd::Start(turn) = cmd {
+            asr.ws = None;
+            active = Some(turn);
+            continue;
+        }
+        let Some(turn) = active.clone() else { continue };
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = turn.cancelled() => {
+                asr.ws = None;
+                active = None;
+                continue;
+            }
+            result = read_result(&mut asr, cmd) => result,
+        };
+        if let Some(text) = result {
+            // A final result retires this input. Queued PCM and duplicate stops have no effect.
+            asr.ws = None;
+            active = None;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = turn.cancelled() => {},
+                result = out.send(AsrOutcome { turn: turn.clone(), text }) => {
+                    if result.is_err() { break; }
                 }
             }
         }
+    }
+}
+
+async fn read_result(asr: &mut DoubaoAsr, cmd: AsrCmd) -> Option<String> {
+    match cmd {
+        AsrCmd::Pcm(pcm) => {
+            if let Err(e) = asr.send_pcm(&pcm).await {
+                error!("发送 ASR 音频失败: {e}");
+                asr.ws = None;
+                return None;
+            }
+            drain_pending(asr, 0).await
+        }
+        AsrCmd::Flush => {
+            let started = tokio::time::Instant::now();
+            if let Err(e) = asr.flush().await {
+                warn!("发送 ASR 结束帧失败: {e}");
+                asr.ws = None;
+            }
+            for _ in 0..FLUSH_WAIT_STEPS {
+                if let Some(text) = drain_pending(asr, 100).await {
+                    debug!(elapsed_ms = started.elapsed().as_millis(), "ASR flush to final");
+                    return Some(text);
+                }
+                if asr.ws.is_none() {
+                    break;
+                }
+            }
+            // Complete a silent or failed input so the device can leave listening.
+            Some(String::new())
+        }
+        AsrCmd::Start(_) => unreachable!("start is handled by the ASR worker"),
     }
 }
 
