@@ -16,6 +16,7 @@ mod webcfg;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use anyhow::Context;
 use axum::routing::{get, post};
 use axum::Router;
 use tracing::{info, warn};
@@ -59,24 +60,23 @@ async fn main() -> anyhow::Result<()> {
         .route("/xiaozhi/ota/", post(ota::handler))
         .route("/xiaozhi/ota/check", post(ota::handler))
         .route("/xiaozhi/v1/", get(session::ws_handler))
-        .route("/config", get(webcfg::page).post(webcfg::save))
+        .merge(webcfg::routes())
         .route("/", get(|| async { "xiaozhi rust server ok" }))
         .with_state(state.clone());
 
     let ws_addr = SocketAddr::from(([0, 0, 0, 0], cfg.server.ws_port));
     let http_addr = SocketAddr::from(([0, 0, 0, 0], cfg.server.http_port));
 
-    let ws_app = app.clone();
-    let http_app = app;
-    tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
-        info!("HTTP(OTA) 监听 {http_addr}");
-        axum::serve(listener, http_app).await.unwrap();
-    });
+    let http_listener = tokio::net::TcpListener::bind(http_addr)
+        .await.with_context(|| format!("无法监听 HTTP(OTA) {http_addr}"))?;
+    let ws_listener = tokio::net::TcpListener::bind(ws_addr)
+        .await.with_context(|| format!("无法监听 WebSocket {ws_addr}"))?;
 
-    let listener = tokio::net::TcpListener::bind(ws_addr).await?;
+    info!("HTTP(OTA) 监听 {http_addr}");
     info!("WebSocket 监听 {ws_addr}  路径 /xiaozhi/v1/");
-    axum::serve(listener, ws_app).await?;
+    let http = axum::serve(http_listener, app.clone().into_make_service_with_connect_info::<SocketAddr>());
+    let ws = axum::serve(ws_listener, app.into_make_service_with_connect_info::<SocketAddr>());
+    tokio::try_join!(async { http.await }, async { ws.await })?;
     Ok(())
 }
 

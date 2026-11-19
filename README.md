@@ -19,7 +19,7 @@
 | 拾音门控 VAD | ✅ | 纯能量门限（无需 Silero/ONNX），`vad.rms_threshold` 可调 |
 | ASR | ✅ | 豆包流式 ASR v3（`bigmodel_async`，二进制帧 + gzip） |
 | LLM | ✅ | 火山方舟 Ark（OpenAI 兼容，SSE 流式） |
-| TTS | ✅ | 豆包语音合成 HTTP v1（整句返回，`pcm`/`wav` 自动处理） |
+| TTS | ✅ | 豆包语音合成 V3 HTTP 单向流式接口，拼接分块 PCM 后按句播放 |
 | 上下文 | ✅ | 保留最近 6 个完整回合（含 assistant tool_calls / tool results）；取消回合不写历史 |
 | 设备 MCP + LLM tool calling | ✅ | `rmcp` 客户端；时间/缓存天气/本地传感器三个只读读数工具固定 schema + 硬兜底，其余设备标准工具（音量/亮度/主题/拍照/板级动作）透传；见第 8 节 |
 | IoT 指令 | ❌ 未实现 | 不执行设备任意指令 |
@@ -35,15 +35,16 @@
 
 ## 3. 配置
 
-配置文件使用 TOML（不再支持旧的 YAML 格式）；完整示例见仓库根目录 `config.toml`。编辑该文件，只有 3 组值必填（**豆包是两套独立凭证**）：
+配置文件使用 TOML，完整示例见仓库根目录 `config.toml`。文本模型和语音项目使用各自的凭证。
 
 | 位置 | 填什么 | 从哪拿 |
 |---|---|---|
-| `llm.api_key` | 火山方舟 API Key | https://console.volcengine.com/ark → API Key |
-| `asr.appid` / `asr.access_token` | 语音识别 APPID + Token | https://console.volcengine.com/speech/service/10038（开通 seed-asr 2.0） |
-| `tts.appid` / `tts.access_token` | 语音合成 APPID + Token | https://console.volcengine.com/speech/service/10035（开通 seed-tts 2.0 并购买音色） |
+| `llm.api_key` / `llm.model` | 方舟 API Key 和已开通的文本模型 ID | [火山方舟控制台](https://console.volcengine.com/ark) |
+| `speech.api_key` | 豆包语音项目 API Key，供 ASR 和 TTS 共用 | 已开通流式语音识别 2.0 和语音合成 2.0 的项目。[豆包语音控制台指引](https://docs.volcengine.com/docs/doubao-voice/console-guidance?lang=zh) |
 
-`tts.voice` 必须是**已购买**的音色 id，例如 `zh_female_xiaohe_uranus_bigtts`（2.0）或 `BV001_streaming`（普通音色）。
+`tts.voice` 填当前项目可用的音色 ID。示例使用小何 2.0（`zh_female_xiaohe_uranus_bigtts`）。
+
+旧配置省略 `[speech]` 时，ASR 使用 `[asr]` 的 `appid` 和 `access_token`，TTS 使用 `[tts]` 的 `appid`、`access_token` 和 `cluster` 调用 V1。V1 需要选用支持的旧版音色。
 
 其余都有默认值，只有调手感时才动：
 
@@ -55,34 +56,37 @@ keep = 2                   # 最多保留几个日志文件
 max_mb = 50                # 单文件上限，超过就切片
 
 [server]
-ws_port = 8000                # websocket
-http_port = 8003           # OTA + 配置页
+ws_port = 26003            # WebSocket
+http_port = 8000            # OTA + 配置页
 
 [vad]
 rms_threshold = 500        # 噪声大造成误触发调高，说话识别不到调低
 start_frames = 2           # 连续多少帧有声音算开口（60ms/帧）
-end_frames = 6             # 静音多少帧算说完（约 400ms）
+end_frames = 6             # 静音多少帧算停顿（约 360ms）。停顿只停止上传尾音，不结束整轮
 
 [asr]
-# 此处仅展示可选项，实际配置还须保留 appid / access_token
 resource_id = "volc.seedasr.sauc.duration"  # 并发版换成 volc.seedasr.sauc.concurrent
+
+[tts]
+resource_id = "seed-tts-2.0"
+voice = "zh_female_xiaohe_uranus_bigtts"
 ```
 
 服务端口明确区分为 `server.ws_port`（WebSocket）和 `server.http_port`（HTTP）。旧字段 `server.port` 仍作为 `ws_port` 的兼容别名，但不能与 `ws_port` 同时填写。
 
 ### 浏览器改配置
 
-打开 `http://<服务器IP>:8003/config` 可以直接编辑 `config.toml` 全文并保存：
+在运行服务的电脑上打开 `http://127.0.0.1:8000/config`，可编辑并保存本次启动使用的配置文件。监听端口不在重载时改变：保存后重启才换端口，重启前 OTA 仍下发当前实际监听的端口。两个端口都在启动时绑定，任一被占用则启动失败并报出端口号。
 
-- **没有密码**，能访问到这个端口就能改配置，只适合局域网（公网请套反向代理加认证）
+- 配置页仅允许本机回环连接和本机 Host。设备的 OTA 与 WebSocket 仍可从局域网访问。反向代理应排除 `/config`。
 - 保存前按 TOML 解析校验，写坏了不会覆盖当前文件；注释原样保留
-- 保存后对**新连接**生效，正在通话的设备重连后生效
+- 模型等配置保存后对**新连接**生效，正在通话的设备重连后生效
 - 带 Origin 校验，挡掉别的网站发起的跨站提交
 
 ## 4. 运行与自测
 
 ```bash
-# 填完 config.toml 后先自检 3 组豆包凭证（不启动服务，失败会指出是哪一项）
+# 自检方舟请求、ASR 模型初始化和 TTS 音频合成
 cargo run -- --check config.toml
 
 cargo build --release
@@ -92,8 +96,8 @@ cargo build --release
 python3 tests/check_ws.py
 # OTA 自测
 # websocket 地址按 Host 头自动组装；从 PC 自测时带上局域网 IP 才是设备会拿到的地址
-curl -s -X POST http://127.0.0.1:8003/xiaozhi/ota/ \
-  -H "Host: 192.168.1.100:8003" \
+curl -s -X POST http://127.0.0.1:8000/xiaozhi/ota/ \
+  -H "Host: 192.168.1.100:8000" \
   -H "device-id: aa:bb:cc:dd:ee:ff" -H "client-id: test" \
   -H "device-version: 1.0.0" -d '{"board":{"type":"bread-compact-wifi"}}'
 # 全量测试（包括本地假设备/假 LLM；不需要云凭据、硬件或 Python）
@@ -102,7 +106,7 @@ cargo test
 
 `tests/check_ws.py` 是可选的 Python 冒烟测试，需安装 `websockets`（本轮使用 15.0.1）；`cargo test` 的真实 WS 回归不需要 Python。
 
-设备端：HTTP OTA 地址填 `http://<服务器IP>:8003/xiaozhi/ota/`，设备会自动拿到 `ws://<IP>:8000/xiaozhi/v1/`。
+设备端：HTTP OTA 地址填 `http://<服务器IP>:8000/xiaozhi/ota/`，设备会自动拿到 `ws://<IP>:26003/xiaozhi/v1/`。两个端口都被占用时服务不会半启动：启动日志会报出绑定失败的端口。`8000` 与 Python 版默认的 WebSocket 端口相同，两套服务不要同时跑在同一台机器的同一网络上。
 
 ## 5. 代码结构（与 Python 版的对应关系）
 
@@ -118,7 +122,7 @@ cargo test
 | `src/llm.rs` | OpenAI-compatible SSE、工具增量解析、ID 校验与有界调用循环；返回最终文本和完整历史 | `core/providers/llm/openai/*` |
 | `src/mcp.rs` | rmcp 客户端、XiaoZhi envelope、发现/工具开放规则/读数校验；`ToolTurn` 集中固定提示、不可用兜底及缓存警告 | — |
 | `tests/support/device_tools.rs` | 无云假设备 / 假 LLM / 真实 WS reader 回归（由 main 的测试模块引入） | — |
-| `src/tts.rs` | 豆包 HTTP v1 合成 | `core/providers/tts/doubao.py` |
+| `src/tts.rs` | 豆包 V3 HTTP 合成和 V1 兼容 | `core/providers/tts/doubao.py` |
 
 MCP 复用官方 Rust SDK `rmcp`（Apache-2.0），SSE 帧解析复用 `eventsource-stream`（MIT/Apache-2.0）；版本由 `Cargo.lock` 锁定，不在项目里重写通用 MCP 或云端 SDK。
 
@@ -135,8 +139,9 @@ MCP 复用官方 Rust SDK `rmcp`（Apache-2.0），SSE 帧解析复用 `eventsou
 |---|---|
 | `Ark LLM 请求失败 401` | `llm.api_key` 错误或未开通模型 |
 | `Ark LLM 请求失败 404` / `model not found` | `llm.model` 换成方舟的推理接入点 ID（`ep-xxxxxxxx`） |
-| `ASR 初始化失败 ... 45000001` | `appid`/`access_token` 或 `resource_id` 与开通的服务不匹配 |
-| `TTS 返回异常 ... "code":3001` | 音色未购买，或 `cluster` 与音色类型不匹配 |
+| 语音接口返回 `401` / `45000010` | 核对 `speech.api_key` 和模型开通的语音项目 |
+| `ASR 初始化失败 ... 45000001` | 核对 ASR 资源 ID 及该资源的开通状态 |
+| `TTS 返回错误 code=...` | 核对 TTS 资源 ID、音色和项目权限，记录响应中的 LogID |
 | 设备一直没反应 | VAD 门限过高（降低 `rms_threshold`），或设备 OTA 未指向本机 |
 
 ## 7. 已知取舍
@@ -146,7 +151,7 @@ MCP 复用官方 Rust SDK `rmcp`（Apache-2.0），SSE 帧解析复用 `eventsou
 - **单设备友好**：每连接独立任务与编解码器，多设备可用，但没做并发上限与限流。
 - **空闲回收**：120 秒没有任何消息就断开该连接（正在回话时不计），设备会自己重连，对唤醒流程透明。
 - **结束会话**：识别到「退下 / 退下吧 / 再见 / 拜拜」时回显 `stt`、下发 `goodbye` 并断开，不再走 LLM。
-- **免唤醒追问**：由固件配网页启用。设备在同一 WebSocket 上用现有 `listen start/stop` 发起下一轮，服务端复用最近的会话上下文。VAD 和设备 stop 均可结束音频输入，每轮接受一次收尾。ASR 与回复绑定同一个取消令牌，新一轮或 abort 会取消旧输入及回复。服务端先完成历史提交，再发送该轮的 `tts stop`。
+- **免唤醒追问**：固件默认开启，可在配网页关闭。设备在同一 WebSocket 上用现有 `listen start/stop` 发起下一轮，服务端复用最近的会话上下文。VAD 和设备 stop 均可结束音频输入，每轮接受一次收尾。ASR 与回复绑定同一个取消令牌，新一轮或 abort 会取消旧输入及回复。服务端先完成历史提交，再发送该轮的 `tts stop`。
 - **延迟诊断**：Debug 日志记录 ASR 从 flush 到最终文本、LLM 与工具合计耗时、TTS 整句合成耗时，以及文本轮次到首音频写入确认的耗时。
 
 

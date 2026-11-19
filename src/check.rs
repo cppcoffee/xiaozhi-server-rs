@@ -4,7 +4,7 @@ use serde_json::json;
 use crate::config::Config;
 use crate::tts::DoubaoTts;
 
-/// `--check`：只验证三组云端凭证是否可用，不启动服务
+/// `--check`：验证三个云端接口，不启动设备服务。
 pub async fn run(cfg: &Config) -> bool {
     println!("=== 小智 Rust Server 凭证自检 ===\n");
     let mut ok = true;
@@ -23,7 +23,7 @@ pub async fn run(cfg: &Config) -> bool {
         Ok(msg) => println!("[ OK ] TTS(豆包)     {msg}"),
         Err(e) => {
             ok = false;
-            println!("[FAIL] TTS(豆包)     {e}");
+            println!("[FAIL] TTS(豆包)     {e:#}");
         }
     }
 
@@ -32,15 +32,15 @@ pub async fn run(cfg: &Config) -> bool {
         Ok(msg) => println!("[ OK ] ASR(豆包)     {msg}"),
         Err(e) => {
             ok = false;
-            println!("[FAIL] ASR(豆包)     {e}");
+            println!("[FAIL] ASR(豆包)     {e:#}");
         }
     }
 
     println!();
     if ok {
-        println!("全部通过，可以启动服务：{} config.toml", env!("CARGO_PKG_NAME"));
+        println!("全部通过，可以用这份配置启动服务");
     } else {
-        println!("有失败项，按上面提示修正 config.toml 后重试");
+        println!("有失败项，请修正本次使用的配置后重试");
     }
     ok
 }
@@ -49,7 +49,10 @@ async fn check_llm(cfg: &Config) -> Result<String> {
     if cfg.llm.api_key.contains("你的") {
         anyhow::bail!("llm.api_key 还是占位符");
     }
-    let url = format!("{}/chat/completions", cfg.llm.base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/chat/completions",
+        cfg.llm.base_url.trim_end_matches('/')
+    );
     let resp = reqwest::Client::new()
         .post(&url)
         .bearer_auth(&cfg.llm.api_key)
@@ -78,9 +81,6 @@ async fn check_llm(cfg: &Config) -> Result<String> {
 }
 
 async fn check_tts(cfg: &Config) -> Result<String> {
-    if cfg.tts.appid.contains("你的") || cfg.tts.access_token.contains("你的") {
-        anyhow::bail!("tts.appid / tts.access_token 还是占位符");
-    }
     let tts = DoubaoTts::new(cfg.tts.clone());
     let pcm = tts.synth("你好，我是小智").await?;
     if pcm.is_empty() {

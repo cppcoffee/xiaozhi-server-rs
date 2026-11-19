@@ -1,10 +1,13 @@
 /// 浏览器配置页：GET 显示 config.toml 原文，POST 校验后写回（注释原样保留）
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use axum::extract::{Form, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{ConnectInfo, Form, Request, State};
+use axum::http::{header, uri::Authority, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
+use axum::{routing::get, Router};
 use tracing::{info, warn};
 
 use crate::config::{Config, ConfigStore};
@@ -19,7 +22,7 @@ textarea{width:100%;box-sizing:border-box;min-height:70vh;font:13px/1.5 ui-monos
 .err{color:#b00;white-space:pre-wrap}.ok{color:#070}
 </style></head><body>
 <h1>xiaozhi-server-rs 配置</h1>
-<p>保存后立即对新的连接生效；正在通话的设备重连后生效。此页无密码，仅限局域网。</p>
+<p>保存后对重启后的新连接生效（监听端口也只在重启后改变）；正在通话的设备重连后生效。请从服务所在电脑打开 http://127.0.0.1:8000/config。</p>
 {{MESSAGE}}
 <form method="post" action="/config">
 <textarea name="config" spellcheck="false" wrap="off">{{TOML}}</textarea>
@@ -27,12 +30,50 @@ textarea{width:100%;box-sizing:border-box;min-height:70vh;font:13px/1.5 ui-monos
 </form></body></html>
 "#;
 
-pub async fn page(State(state): State<Arc<ConfigStore>>) -> Response {
+pub fn routes() -> Router<Arc<ConfigStore>> {
+    Router::new()
+        .route("/config", get(page).post(save))
+        .route_layer(middleware::from_fn(local_only))
+}
+
+async fn local_only(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<Authority>().ok());
+    // Validate the Host as well so an arbitrary browser origin cannot redirect
+    // its DNS to a loopback address and read the local configuration.
+    if !peer.ip().is_loopback() || !host.as_ref().is_some_and(local_host) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn local_host(authority: &Authority) -> bool {
+    let host = authority.host();
+    let ip = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost") || ip.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+async fn page(State(state): State<Arc<ConfigStore>>) -> Response {
     let text = std::fs::read_to_string(&state.path).unwrap_or_default();
     render(StatusCode::OK, &text, "")
 }
 
-pub async fn save(
+async fn save(
     State(state): State<Arc<ConfigStore>>,
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
@@ -118,12 +159,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_toml_preserves_comments_and_updates_new_connections() {
+    async fn save_toml_preserves_comments_and_applies_on_restart() {
         let fixture = Fixture::new();
         let old = fixture.state.current();
         let text = format!(
             "# 网页保存保留注释\n{}",
-            include_str!("../config.toml").replace("ws_port = 8000", "ws_port = 9000")
+            include_str!("../config.toml").replace("ws_port = 26003", "ws_port = 9000")
         );
         let response = save(
             State(fixture.state.clone()),
@@ -137,8 +178,9 @@ mod tests {
             Config::load(&fixture.state.path).unwrap().server.ws_port,
             9000
         );
-        assert_eq!(fixture.state.current().server.ws_port, 9000);
-        assert_eq!(old.server.ws_port, 8000);
+        // Listeners cannot move on reload: OTA keeps the bound port until restart.
+        assert_eq!(fixture.state.current().server.ws_port, 26003);
+        assert_eq!(fixture.state.current().server.http_port, old.server.http_port);
     }
 
     #[tokio::test]
@@ -163,5 +205,88 @@ mod tests {
             include_str!("../config.toml")
         );
         assert!(Arc::ptr_eq(&old, &fixture.state.current()));
+    }
+    #[test]
+    fn only_loopback_authorities_are_allowed() {
+        for name in [
+            "127.0.0.1",
+            "[::1]",
+            "localhost",
+            "LOCALHOST:8000",
+        ] {
+            assert!(local_host(&name.parse().unwrap()), "{name}");
+        }
+        for name in [
+            "localhost.example",
+            "192.168.1.2",
+            "0.0.0.0",
+            "[::]",
+        ] {
+            assert!(!local_host(&name.parse().unwrap()), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn management_rejects_remote_peers_and_untrusted_hosts_before_reading_or_writing() {
+        let client = reqwest::Client::new();
+        for (peer, host, expected) in [
+            (
+                "192.168.1.25:41000",
+                "127.0.0.1",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "127.0.0.1:41000",
+                "other.example",
+                StatusCode::FORBIDDEN,
+            ),
+            ("127.0.0.1:41000", "127.0.0.1", StatusCode::OK),
+        ] {
+            let fixture = Fixture::new();
+            let initial = std::fs::read_to_string(&fixture.state.path).unwrap();
+            let saved = format!("# management-test-change\n{initial}");
+            let app = routes()
+                .with_state(fixture.state.clone())
+                .layer(axum::Extension(ConnectInfo(
+                    peer.parse::<SocketAddr>().unwrap(),
+                )));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/config", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let reply = client
+                .get(&url)
+                .header(header::HOST, host)
+                .header("X-Forwarded-For", "127.0.0.1")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), expected);
+            if expected == StatusCode::OK {
+                assert_eq!(reply.headers()[header::CACHE_CONTROL], "no-store");
+                assert!(reply.text().await.unwrap().contains("[server]"));
+            } else {
+                assert!(reply.text().await.unwrap().is_empty());
+            }
+            let reply = client
+                .post(&url)
+                .header(header::HOST, host)
+                .header(header::ORIGIN, format!("http://{host}"))
+                .form(&[("config", &saved)])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), expected);
+            let actual = std::fs::read_to_string(&fixture.state.path).unwrap();
+            assert_eq!(
+                &actual,
+                if expected == StatusCode::OK {
+                    &saved
+                } else {
+                    &initial
+                }
+            );
+            server.abort();
+        }
     }
 }

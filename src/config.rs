@@ -1,3 +1,6 @@
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::{Arc, RwLock};
 
 use serde::Deserialize;
@@ -15,15 +18,25 @@ pub struct Config {
     #[serde(default)]
     pub vad: VadCfg,
     pub llm: LlmCfg,
+    speech: Option<SpeechCfg>,
     pub asr: AsrCfg,
     pub tts: TtsCfg,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct SpeechCfg {
+    api_key: String,
+}
+
+pub(crate) fn credential_missing(value: &str) -> bool {
+    value.trim().is_empty() || value.contains("你的")
+}
+
 fn d_ws_port() -> u16 {
-    8000
+    26003
 }
 fn d_http_port() -> u16 {
-    8003
+    8000
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,7 +103,8 @@ fn d_end_frames() -> u32 {
     6
 }
 
-/// 纯能量门限 VAD：环境噪声大就调高 rms_threshold，说话识别不到就调低
+/// 纯能量门限 VAD：只决定何时开始/停止上传音频；整轮由设备 listen stop 或 20 秒上限结束。
+/// 环境噪声大就调高 rms_threshold，说话识别不到调低
 #[derive(Debug, Clone, Deserialize)]
 pub struct VadCfg {
     #[serde(default = "d_rms")]
@@ -138,12 +152,18 @@ pub struct AsrCfg {
     /// 留着可指向本地假 ASR 做联调；默认豆包
     #[serde(default = "d_asr_url")]
     pub ws_url: String,
+    #[serde(skip)]
+    pub speech_api_key: Option<Arc<str>>,
+    #[serde(default)]
     pub appid: String,
+    #[serde(default)]
     pub access_token: String,
     /// 并发版换成 volc.seedasr.sauc.concurrent
     #[serde(default = "d_asr_resource")]
     pub resource_id: String,
 }
+
+const TTS_V3_URL: &str = "https://openspeech.bytedance.com/api/v3/tts/unidirectional";
 
 fn d_tts_url() -> String {
     "https://openspeech.bytedance.com/api/v1/tts".into()
@@ -153,22 +173,41 @@ fn d_cluster() -> String {
     "volcano_tts".into()
 }
 
+fn d_tts_resource() -> String {
+    "seed-tts-2.0".into()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TtsCfg {
     /// 留着可指向本地假 TTS 做联调；默认豆包
     #[serde(default = "d_tts_url")]
     pub api_url: String,
+    #[serde(skip)]
+    pub speech_api_key: Option<Arc<str>>,
+    #[serde(default)]
     pub appid: String,
+    #[serde(default)]
     pub access_token: String,
-    /// 必须是已购买的音色
+    /// 当前项目可用的音色 ID
     pub voice: String,
     #[serde(default = "d_cluster")]
     pub cluster: String,
+    #[serde(default = "d_tts_resource")]
+    pub resource_id: String,
 }
 
 impl Config {
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        Ok(toml::from_str(text)?)
+        let mut cfg: Self = toml::from_str(text)?;
+        if let Some(speech) = cfg.speech.take() {
+            let key: Arc<str> = Arc::from(speech.api_key.trim());
+            cfg.asr.speech_api_key = Some(key.clone());
+            cfg.tts.speech_api_key = Some(key);
+            if cfg.tts.api_url == d_tts_url() {
+                cfg.tts.api_url = TTS_V3_URL.into();
+            }
+        }
+        Ok(cfg)
     }
 
     pub fn load(path: &str) -> anyhow::Result<Self> {
@@ -217,11 +256,23 @@ impl ConfigStore {
     }
 
     /// 先写临时文件再改名，避免把正在用的 config.toml 写坏
-    pub fn replace(&self, text: &str, next: Config) -> anyhow::Result<()> {
-        let tmp = format!("{}.tmp", self.path);
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(&tmp, &self.path)?;
-        *self.cfg.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+    pub fn replace(&self, text: &str, mut next: Config) -> anyhow::Result<()> {
+        let tmp = format!("{}.{}.tmp", self.path, uuid::Uuid::new_v4());
+        let mut current = self.cfg.write().unwrap_or_else(|e| e.into_inner());
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&tmp)?;
+        let written = file.write_all(text.as_bytes());
+        drop(file);
+        if let Err(error) = written.and_then(|_| std::fs::rename(&tmp, &self.path)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error.into());
+        }
+        // Listeners do not move on reload; OTA must advertise the bound port.
+        next.server = current.server.clone();
+        *current = Arc::new(next);
         Ok(())
     }
 }
@@ -246,18 +297,19 @@ voice = "test-voice"
     #[test]
     fn example_toml_parses() {
         let cfg = Config::parse(include_str!("../config.toml")).unwrap();
-        assert_eq!(cfg.server.ws_port, 8000);
-        assert_eq!(cfg.server.http_port, 8003);
+        assert_eq!(cfg.server.ws_port, 26003);
+        assert_eq!(cfg.server.http_port, 8000);
         assert_eq!(cfg.vad.rms_threshold, 500.0);
         assert!(cfg.llm.prompt.contains("你是一个名叫小智的智能助手"));
         assert!(cfg.llm.prompt.ends_with('\n'));
+        assert_eq!(cfg.tts.api_url, TTS_V3_URL);
     }
 
     #[test]
     fn minimal_toml_uses_defaults() {
         let cfg = Config::parse(MINIMAL).unwrap();
-        assert_eq!(cfg.server.ws_port, 8000);
-        assert_eq!(cfg.server.http_port, 8003);
+        assert_eq!(cfg.server.ws_port, 26003);
+        assert_eq!(cfg.server.http_port, 8000);
         assert_eq!(cfg.log.level, "info");
         assert_eq!(cfg.log.keep, 2);
         assert_eq!(cfg.vad.rms_threshold, 500.0);
@@ -269,6 +321,23 @@ voice = "test-voice"
         assert_eq!(cfg.asr.resource_id, d_asr_resource());
         assert_eq!(cfg.tts.api_url, d_tts_url());
         assert_eq!(cfg.tts.cluster, "volcano_tts");
+    }
+
+    #[test]
+    fn shared_speech_key_uses_v3_and_preserves_configured_endpoint() {
+        let config = |url: &str| {
+            Config::parse(&format!(
+                "[speech]\napi_key = \" project-key \"\n{MINIMAL}{url}"
+            ))
+            .unwrap()
+        };
+        let cfg = config("");
+        assert_eq!(cfg.asr.speech_api_key.as_deref(), Some("project-key"));
+        assert_eq!(cfg.tts.speech_api_key.as_deref(), Some("project-key"));
+        assert_eq!(cfg.tts.api_url, TTS_V3_URL);
+        assert_eq!(cfg.tts.resource_id, "seed-tts-2.0");
+        let cfg = config("api_url = \"http://127.0.0.1/tts\"");
+        assert_eq!(cfg.tts.api_url, "http://127.0.0.1/tts");
     }
 
     #[test]

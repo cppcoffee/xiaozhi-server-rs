@@ -1,17 +1,20 @@
-use std::io::Write;
+use std::io::{Read, Write};
+use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{bail, ensure, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::config::AsrCfg;
+use crate::config::{credential_missing, AsrCfg};
 
 #[derive(Debug)]
 pub enum AsrCmd {
@@ -29,88 +32,115 @@ const MSG_FULL_CLIENT_REQUEST: u8 = 0x01;
 const MSG_AUDIO_ONLY_REQUEST: u8 = 0x02;
 const SERIAL_JSON: u8 = 0x01;
 const COMPRESS_GZIP: u8 = 0x01;
+const FLAG_SEQUENCE: u8 = 0x01;
+const FLAG_LAST: u8 = 0x02;
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const ASR_PACKET_MS: u32 = 180;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Flush 后等最终结果的步数（100ms/步）。豆包正常 <1s，给到 10s，
 /// 避免出结果慢一点就把整轮静默丢掉
 const FLUSH_WAIT_STEPS: usize = 100;
 
-fn gzip(data: &[u8]) -> Vec<u8> {
+fn gzip(data: &[u8]) -> Result<Vec<u8>> {
     let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(data).ok();
-    enc.finish().unwrap_or_default()
+    enc.write_all(data)?;
+    Ok(enc.finish()?)
 }
 
-fn gunzip(data: &[u8]) -> Option<Vec<u8>> {
-    let mut dec = flate2::read::GzDecoder::new(data);
+fn gunzip(data: &[u8]) -> Result<Vec<u8>> {
+    let dec = flate2::read::GzDecoder::new(data);
     let mut out = Vec::new();
-    std::io::Read::read_to_end(&mut dec, &mut out).ok()?;
-    Some(out)
+    dec.take(MAX_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut out)?;
+    ensure!(out.len() <= MAX_RESPONSE_BYTES, "ASR 解压响应超出大小限制");
+    Ok(out)
 }
 
-/// 豆包 v3 二进制帧头：4 字节
-fn header(msg_type: u8, flags: u8, compress: u8) -> [u8; 4] {
-    [
-        (0x01 << 4) | 0x01,                // version=1, header_size=1
-        (msg_type << 4) | (flags & 0x0f),  // msg type + flags
-        (SERIAL_JSON << 4) | compress,     // serialization + compression
-        0x00,
-    ]
-}
-
-fn frame(msg_type: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
-    let body = gzip(payload);
-    let mut buf = Vec::with_capacity(8 + body.len());
-    buf.extend_from_slice(&header(msg_type, flags, COMPRESS_GZIP));
+fn frame(msg_type: u8, last: bool, sequence: Option<i32>, payload: &[u8]) -> Result<Vec<u8>> {
+    let body = gzip(payload)?;
+    let mut buf = Vec::with_capacity(12 + body.len());
+    let mut flags = if last { FLAG_LAST } else { 0 };
+    if sequence.is_some() {
+        flags |= FLAG_SEQUENCE;
+    }
+    let serialization = if msg_type == MSG_AUDIO_ONLY_REQUEST && sequence.is_some() {
+        0 // Raw PCM in API Key mode.
+    } else {
+        SERIAL_JSON
+    };
+    buf.extend_from_slice(&[
+        0x11,
+        (msg_type << 4) | flags,
+        (serialization << 4) | COMPRESS_GZIP,
+        0,
+    ]);
+    if let Some(sequence) = sequence {
+        buf.extend_from_slice(&(if last { -sequence } else { sequence }).to_be_bytes());
+    }
     buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
     buf.extend_from_slice(&body);
-    buf
+    Ok(buf)
 }
 
 /// 解析服务端返回帧
-fn parse_frame(res: &[u8]) -> Result<Value> {
-    if res.len() < 4 {
-        return Err(anyhow!("响应长度不足: {}", res.len()));
-    }
+fn parse_frame(res: &[u8], legacy: bool) -> Result<(Value, bool)> {
+    ensure!(res.len() >= 4 && res[0] >> 4 == 1, "ASR 响应帧头无效");
+    let header_size = usize::from(res[0] & 0x0f) * 4;
+    ensure!(
+        header_size >= 4 && res.len() >= header_size,
+        "ASR 响应帧头不完整"
+    );
     let msg_type = res[1] >> 4;
+    let flags = res[1] & 0x0f;
     let compress = res[2] & 0x0f;
-
-    if msg_type == 0x0f {
-        // 错误帧：code(4) + length(4) + json
-        let code = if res.len() >= 8 {
-            u32::from_be_bytes([res[4], res[5], res[6], res[7]])
-        } else {
-            0
-        };
-        let body = if res.len() > 12 { &res[12..] } else { &res[4..] };
-        let body = if compress == COMPRESS_GZIP {
-            gunzip(body).unwrap_or_else(|| body.to_vec())
-        } else {
-            body.to_vec()
-        };
-        let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
-        return Err(anyhow!("ASR 错误 code={} body={}", code, v));
-    }
-
-    let body = if res.len() >= 12 {
-        let len = u32::from_be_bytes([res[8], res[9], res[10], res[11]]) as usize;
-        if len > 0 && 12 + len <= res.len() {
-            &res[12..12 + len]
-        } else {
-            &res[8..]
+    ensure!(
+        matches!(msg_type, 0x09 | 0x0f),
+        "ASR 响应类型未知: {msg_type}"
+    );
+    let mut data = &res[header_size..];
+    let error_code = if msg_type == 0x0f {
+        Some(read_u32(&mut data)?)
+    } else {
+        if flags & FLAG_SEQUENCE != 0 || (legacy && data.starts_with(&[0; 4]) && data.len() > 4) {
+            read_u32(&mut data)?;
         }
-    } else {
-        &res[4..]
+        None
     };
-    let raw = if body.first() == Some(&0x1f) {
-        gunzip(body).unwrap_or_else(|| body.to_vec())
+    let len = read_u32(&mut data)? as usize;
+    ensure!(len == data.len(), "ASR 响应数据长度无效");
+    let decompressed;
+    if compress == COMPRESS_GZIP {
+        decompressed = gunzip(data)?;
+        data = &decompressed;
     } else {
-        body.to_vec()
-    };
-    let v: Value = serde_json::from_slice(&raw)?;
-    Ok(v)
+        ensure!(compress == 0, "ASR 响应压缩格式未知: {compress}");
+    }
+    if let Some(code) = error_code {
+        let message: String = String::from_utf8_lossy(data).chars().take(240).collect();
+        bail!("ASR 错误 code={code}: {message}");
+    }
+    let value = serde_json::from_slice(data).context("ASR 响应 JSON 无效")?;
+    Ok((value, flags & FLAG_LAST != 0))
+}
+
+fn read_u32(data: &mut &[u8]) -> Result<u32> {
+    let (bytes, rest) = data.split_first_chunk().context("ASR 响应字段不完整")?;
+    *data = rest;
+    Ok(u32::from_be_bytes(*bytes))
 }
 
 fn request_json(cfg: &AsrCfg, sample_rate: u32) -> Value {
+    if cfg.speech_api_key.is_some() {
+        return json!({
+            "user": { "uid": "xiaozhi-rust" },
+            "audio": { "format": "pcm", "codec": "raw", "rate": sample_rate, "bits": 16, "channel": 1 },
+            "request": {
+                "model_name": "bigmodel", "result_type": "full",
+                "enable_itn": true, "enable_punc": true, "show_utterances": true
+            }
+        });
+    }
     json!({
         "app": { "appid": cfg.appid, "token": cfg.access_token },
         "user": { "uid": "streaming_asr_service" },
@@ -138,7 +168,7 @@ fn request_json(cfg: &AsrCfg, sample_rate: u32) -> Value {
 fn extract_text(v: &Value) -> Option<String> {
     if let Some(code) = v.get("code").and_then(|c| c.as_i64()) {
         // 1013：无有效语音，属正常
-        if code == 20000000 || code == 1013 {
+        if code == 1013 {
             return None;
         }
     }
@@ -161,14 +191,16 @@ fn extract_text(v: &Value) -> Option<String> {
 }
 
 /// ASR 长连接管理：懒连接、流式送音频、吐最终文本
+type AsrSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
 pub struct DoubaoAsr {
     cfg: AsrCfg,
     sample_rate: u32,
-    ws: Option<
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    >,
+    ws: Option<AsrSocket>,
+    next_sequence: Option<i32>,
+    pending_pcm: Vec<u8>,
+    confirmed_text: Option<String>,
 }
 
 impl DoubaoAsr {
@@ -177,63 +209,132 @@ impl DoubaoAsr {
             cfg,
             sample_rate,
             ws: None,
+            next_sequence: None,
+            pending_pcm: Vec::new(),
+            confirmed_text: None,
         }
     }
 
     async fn connect(&mut self) -> Result<()> {
+        self.reset();
+        self.ws = Some(
+            tokio::time::timeout(CONNECT_TIMEOUT, self.open())
+                .await
+                .context("ASR 建连或初始化超时")??,
+        );
+        self.next_sequence = self.cfg.speech_api_key.as_ref().map(|_| 2);
+        info!(
+            "ASR 连接已建立 ({} / {})",
+            self.cfg.ws_url, self.cfg.resource_id
+        );
+        Ok(())
+    }
+
+    async fn open(&self) -> Result<AsrSocket> {
         let mut req = self.cfg.ws_url.clone().into_client_request()?;
         let h = req.headers_mut();
-        h.insert("X-Api-App-Key", self.cfg.appid.parse()?);
-        h.insert("X-Api-Access-Key", self.cfg.access_token.parse()?);
+        let request_id = Uuid::new_v4().to_string();
+        let modern = self.cfg.speech_api_key.is_some();
+        if let Some(key) = &self.cfg.speech_api_key {
+            ensure!(
+                !credential_missing(key),
+                "请在 [speech] 填写豆包语音项目 API Key"
+            );
+            let mut key = HeaderValue::from_str(key).context("[speech].api_key 格式不合法")?;
+            key.set_sensitive(true);
+            h.insert("X-Api-Key", key);
+            h.insert("X-Api-Request-Id", request_id.parse()?);
+        } else {
+            ensure!(
+                !credential_missing(&self.cfg.appid) && !credential_missing(&self.cfg.access_token),
+                "请填写 [asr] 的旧版 APP ID 和 Access Token，或配置 [speech].api_key"
+            );
+            h.insert("X-Api-App-Key", self.cfg.appid.parse()?);
+            let mut token = HeaderValue::from_str(&self.cfg.access_token)
+                .context("[asr].access_token 格式不合法")?;
+            token.set_sensitive(true);
+            h.insert("X-Api-Access-Key", token);
+        }
         h.insert("X-Api-Resource-Id", self.cfg.resource_id.parse()?);
-        h.insert("X-Api-Connect-Id", Uuid::new_v4().to_string().parse()?);
-
-        let (ws, _) = tokio_tungstenite::connect_async(req).await?;
-        self.ws = Some(ws);
-
-        // 初始化请求
+        h.insert("X-Api-Connect-Id", request_id.parse()?);
+        let config = WebSocketConfig::default().max_message_size(Some(MAX_RESPONSE_BYTES));
+        let (mut ws, response) =
+            tokio_tungstenite::connect_async_with_config(req, Some(config), false).await?;
+        let log_id = response
+            .headers()
+            .get("X-Tt-Logid")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(&request_id);
         let payload = serde_json::to_vec(&request_json(&self.cfg, self.sample_rate))?;
-        let f = frame(MSG_FULL_CLIENT_REQUEST, 0x00, &payload);
-        self.ws.as_mut().unwrap().send(Message::Binary(f.into())).await?;
-
-        // 等初始化响应
-        if let Some(msg) = self.ws.as_mut().unwrap().next().await {
+        let f = frame(
+            MSG_FULL_CLIENT_REQUEST,
+            false,
+            modern.then_some(1),
+            &payload,
+        )?;
+        ws.send(Message::Binary(f.into())).await?;
+        while let Some(msg) = ws.next().await {
             match msg? {
-                Message::Binary(b) => {
-                    let v = parse_frame(&b)?;
-                    if let Some(code) = v.get("code").and_then(|c| c.as_i64()) {
-                        if code != 0 && code != 1000 && code != 20000000 {
-                            return Err(anyhow!("ASR 初始化失败: {}", v));
-                        }
+                Message::Binary(bytes) => {
+                    let (value, last) = parse_frame(&bytes, !modern)
+                        .with_context(|| format!("ASR 初始化失败（LogID {log_id}）"))?;
+                    ensure!(!last, "ASR 初始化收到结束帧（LogID {log_id}）");
+                    if let Some(code) = value["code"].as_i64() {
+                        ensure!(
+                            matches!(code, 0 | 1000 | 20_000_000),
+                            "ASR 初始化失败 code={code}（LogID {log_id}）"
+                        );
                     }
-                    debug!("ASR 初始化响应: {}", v);
+                    debug!("ASR 初始化成功（LogID {log_id}）");
+                    return Ok(ws);
                 }
-                other => warn!("ASR 初始化收到非二进制帧: {:?}", other),
+                Message::Ping(_) | Message::Pong(_) => {}
+                _ => break,
             }
         }
-        info!("ASR 连接已建立 ({} / {})", self.cfg.ws_url, self.cfg.resource_id);
-        Ok(())
+        bail!("ASR 初始化无有效响应（LogID {log_id}）")
     }
 
     async fn send_pcm(&mut self, pcm: &[i16]) -> Result<()> {
         if self.ws.is_none() {
             self.connect().await?;
         }
-        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-        let f = frame(MSG_AUDIO_ONLY_REQUEST, 0x00, &bytes);
-        if let Some(ws) = self.ws.as_mut() {
-            ws.send(Message::Binary(f.into())).await?;
+        let bytes = pcm.iter().flat_map(|s| s.to_le_bytes());
+        if self.cfg.speech_api_key.is_some() {
+            self.pending_pcm.extend(bytes);
+            let packet_size = (self.sample_rate * ASR_PACKET_MS / 1000 * 2) as usize;
+            // Retain the final audio for the terminal packet, including exact packet multiples.
+            while self.pending_pcm.len() > packet_size {
+                let packet: Vec<u8> = self.pending_pcm.drain(..packet_size).collect();
+                self.send_audio(&packet, false).await?;
+            }
+        } else {
+            self.send_audio(&bytes.collect::<Vec<_>>(), false).await?;
         }
         Ok(())
     }
 
-    /// 发结束帧（gzip 空负载），通知服务端出最终结果
-    async fn flush(&mut self) -> Result<()> {
+    async fn send_audio(&mut self, data: &[u8], last: bool) -> Result<()> {
         if let Some(ws) = self.ws.as_mut() {
-            let f = frame(MSG_AUDIO_ONLY_REQUEST, 0x02, b"");
+            let f = frame(MSG_AUDIO_ONLY_REQUEST, last, self.next_sequence, data)?;
             ws.send(Message::Binary(f.into())).await?;
+            if let Some(sequence) = self.next_sequence.as_mut() {
+                *sequence += 1;
+            }
         }
         Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        let pending = std::mem::take(&mut self.pending_pcm);
+        self.send_audio(&pending, true).await
+    }
+
+    fn reset(&mut self) {
+        self.ws = None;
+        self.pending_pcm.clear();
+        self.confirmed_text = None;
+        self.next_sequence = None;
     }
 
     async fn close(&mut self) {
@@ -244,7 +345,8 @@ impl DoubaoAsr {
 }
 
 /// 非阻塞地取出 ws 上已到达的所有帧，返回可能出现的最终文本
-async fn drain_pending(asr: &mut DoubaoAsr, wait_ms: u64) -> Option<String> {
+async fn drain_pending(asr: &mut DoubaoAsr, wait_ms: u64) -> Result<Option<String>> {
+    let modern = asr.cfg.speech_api_key.is_some();
     let mut text = None;
     let mut first = true;
     loop {
@@ -254,30 +356,46 @@ async fn drain_pending(asr: &mut DoubaoAsr, wait_ms: u64) -> Option<String> {
             std::time::Duration::from_millis(0)
         };
         first = false;
-        let Some(ws) = asr.ws.as_mut() else { return text };
+        let Some(ws) = asr.ws.as_mut() else {
+            return Ok(text);
+        };
         match tokio::time::timeout(timeout, ws.next()).await {
-            Ok(Some(Ok(Message::Binary(b)))) => match parse_frame(&b) {
-                Ok(v) => {
-                    if let Some(t) = extract_text(&v) {
-                        info!("ASR 识别: {t}");
-                        text = Some(t);
-                    } else if v.get("result").is_some() {
-                        debug!("ASR 中间结果: {v}");
-                    }
+            Ok(Some(Ok(Message::Binary(bytes)))) => {
+                let (value, last) = parse_frame(&bytes, !modern)?;
+                if let Some(code) = value["code"].as_i64() {
+                    ensure!(
+                        matches!(code, 0 | 1000 | 1013 | 20_000_000),
+                        "ASR 识别失败 code={code}"
+                    );
                 }
-                Err(e) => warn!("ASR 解析失败: {e}"),
-            },
+                if modern {
+                    if let Some(confirmed) = extract_text(&value) {
+                        asr.confirmed_text = Some(confirmed);
+                    }
+                    // Optimized streaming may emit interim text before the user stops speaking.
+                    if last {
+                        let final_text = value["result"]["text"]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|text| !text.is_empty())
+                            .map(str::to_owned)
+                            .or_else(|| asr.confirmed_text.take())
+                            .unwrap_or_default();
+                        info!("ASR 识别: {final_text}");
+                        return Ok(Some(final_text));
+                    }
+                } else if let Some(recognized) = extract_text(&value) {
+                    info!("ASR 识别: {recognized}");
+                    text = Some(recognized);
+                }
+            }
             Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
                 asr.ws = None;
-                return text;
+                return Ok(text);
             }
             Ok(Some(Ok(_))) => continue,
-            Ok(Some(Err(e))) => {
-                warn!("ASR 连接错误: {e}");
-                asr.ws = None;
-                return text;
-            }
-            Err(_) => return text,
+            Ok(Some(Err(error))) => return Err(error.into()),
+            Err(_) => return Ok(text),
         }
     }
 }
@@ -302,14 +420,14 @@ pub async fn run_asr(
                     None => std::future::pending().await,
                 }
             } => {
-                asr.ws = None;
+                asr.reset();
                 active = None;
                 continue;
             }
             cmd = rx.recv() => match cmd { Some(cmd) => cmd, None => break },
         };
         if let AsrCmd::Start(turn) = cmd {
-            asr.ws = None;
+            asr.reset();
             active = Some(turn);
             continue;
         }
@@ -318,7 +436,7 @@ pub async fn run_asr(
             biased;
             _ = cancel.cancelled() => break,
             _ = turn.cancelled() => {
-                asr.ws = None;
+                asr.reset();
                 active = None;
                 continue;
             }
@@ -326,7 +444,7 @@ pub async fn run_asr(
         };
         if let Some(text) = result {
             // A final result retires this input. Queued PCM and duplicate stops have no effect.
-            asr.ws = None;
+            asr.reset();
             active = None;
             tokio::select! {
                 biased;
@@ -341,50 +459,147 @@ pub async fn run_asr(
 }
 
 async fn read_result(asr: &mut DoubaoAsr, cmd: AsrCmd) -> Option<String> {
-    match cmd {
+    let result = match cmd {
         AsrCmd::Pcm(pcm) => {
             if let Err(e) = asr.send_pcm(&pcm).await {
-                error!("发送 ASR 音频失败: {e}");
-                asr.ws = None;
-                return None;
+                error!("发送 ASR 音频失败: {e:#}");
+                asr.reset();
+                return asr.cfg.speech_api_key.as_ref().map(|_| String::new());
             }
             drain_pending(asr, 0).await
         }
         AsrCmd::Flush => {
-            let started = tokio::time::Instant::now();
-            if let Err(e) = asr.flush().await {
-                warn!("发送 ASR 结束帧失败: {e}");
-                asr.ws = None;
-            }
-            for _ in 0..FLUSH_WAIT_STEPS {
-                if let Some(text) = drain_pending(asr, 100).await {
-                    debug!(elapsed_ms = started.elapsed().as_millis(), "ASR flush to final");
-                    return Some(text);
+            async {
+                let started = tokio::time::Instant::now();
+                asr.flush().await?;
+                for _ in 0..FLUSH_WAIT_STEPS {
+                    if let Some(text) = drain_pending(asr, 100).await? {
+                        debug!(
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "ASR flush to final"
+                        );
+                        return Ok(Some(text));
+                    }
+                    if asr.ws.is_none() {
+                        break;
+                    }
                 }
-                if asr.ws.is_none() {
-                    break;
-                }
+                // Complete a silent or failed input so the device can leave listening.
+                Ok(Some(String::new()))
             }
-            // Complete a silent or failed input so the device can leave listening.
-            Some(String::new())
+            .await
         }
         AsrCmd::Start(_) => unreachable!("start is handled by the ASR worker"),
+    };
+    match result {
+        Ok(text) => text,
+        Err(error) => {
+            warn!("ASR 识别链路失败: {error:#}");
+            asr.reset();
+            Some(String::new())
+        }
     }
 }
 
-/// `--check` 用：只做握手 + 初始化，验证 appid/token/resource_id 是否匹配
+/// `--check` 用：完成握手和模型初始化，验证鉴权及资源 ID。
 pub async fn probe(cfg: &crate::config::AsrCfg, sample_rate: u32) -> Result<String> {
-    if cfg.appid.contains("你的") || cfg.access_token.contains("你的") {
-        return Err(anyhow!("asr.appid / asr.access_token 还是占位符（请检查 config.toml 的 [asr]）"));
-    }
     let mut asr = DoubaoAsr::new(cfg.clone(), sample_rate);
     asr.connect().await?;
-    // 发一个结束帧，确认能被服务端接受
-    asr.flush().await?;
-    let text = drain_pending(&mut asr, 1500).await;
-    asr.close().await;
-    Ok(match text {
-        Some(t) => format!("连接成功 ({} )，静音探测返回: {}", cfg.resource_id, t),
-        None => format!("连接成功 ({} )，静音探测无文本（正常）", cfg.resource_id),
-    })
+    let _ = tokio::time::timeout(Duration::from_secs(1), asr.close()).await;
+    Ok(format!("已完成模型初始化 ({})", cfg.resource_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+    #[tokio::test]
+    async fn project_key_sends_pcm_and_waits_for_full_final_transcript() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_hdr_async(
+                socket,
+                |request: &Request, response: Response| {
+                    assert_eq!(request.headers()["X-Api-Key"], "test-voice-key");
+                    assert_eq!(
+                        request.headers()["X-Api-Resource-Id"],
+                        "volc.seedasr.sauc.duration"
+                    );
+                    assert_ne!(request.headers()["X-Api-Request-Id"], "");
+                    assert!(!request.headers().contains_key("X-Api-Access-Key"));
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let init = ws.next().await.unwrap().unwrap().into_data();
+            assert_eq!(&init[..8], &[0x11, 0x11, 0x11, 0, 0, 0, 0, 1]);
+            let request: Value = serde_json::from_slice(&gunzip(&init[12..]).unwrap()).unwrap();
+            assert_eq!(request["request"]["model_name"], "bigmodel");
+            assert_eq!(request["request"]["result_type"], "full");
+            assert_eq!(request["audio"]["rate"], 16000);
+            assert!(request.get("app").is_none());
+            ws.send(Message::Binary(
+                frame(9, false, Some(1), br#"{"code":20000000}"#)
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            let audio = ws.next().await.unwrap().unwrap().into_data();
+            assert_eq!(&audio[..8], &[0x11, 0x21, 0x01, 0, 0, 0, 0, 2]);
+            assert_eq!(gunzip(&audio[12..]).unwrap().len(), 3 * 960 * 2);
+            let partial =
+                json!({"result":{"text":"现在","utterances":[{"text":"现在","definite":true}]}});
+            ws.send(Message::Binary(
+                frame(9, false, Some(2), &serde_json::to_vec(&partial).unwrap())
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+            let terminal = ws.next().await.unwrap().unwrap().into_data();
+            assert_eq!(&terminal[..4], &[0x11, 0x23, 0x01, 0]);
+            assert_eq!(&terminal[4..8], &(-3i32).to_be_bytes());
+            assert_eq!(gunzip(&terminal[12..]).unwrap().len(), 2 * 960 * 2);
+            let result = json!({"code":20000000,"result":{"text":"现在几点了？"}});
+            ws.send(Message::Binary(
+                frame(9, true, Some(3), &serde_json::to_vec(&result).unwrap())
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        });
+
+        let mut cfg = crate::config::Config::parse(include_str!("../config.toml"))
+            .unwrap()
+            .asr;
+        cfg.speech_api_key = Some("test-voice-key".into());
+        cfg.ws_url = format!("ws://{address}");
+        let (tx, rx) = mpsc::channel(8);
+        let (out, mut results) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(run_asr(cfg, 16000, rx, out, cancel.clone()));
+        tx.send(AsrCmd::Start(CancellationToken::new()))
+            .await
+            .unwrap();
+        for _ in 0..5 {
+            tx.send(AsrCmd::Pcm(vec![500; 960])).await.unwrap();
+        }
+        tx.send(AsrCmd::Flush).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), results.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.text, "现在几点了？");
+        cancel.cancel();
+        worker.await.unwrap();
+        server.await.unwrap();
+    }
 }

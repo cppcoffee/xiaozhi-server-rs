@@ -3,7 +3,7 @@
 import asyncio, json, sys
 import websockets
 
-URL = sys.argv[1] if len(sys.argv) > 1 else "ws://127.0.0.1:8000/xiaozhi/v1/"
+URL = sys.argv[1] if len(sys.argv) > 1 else "ws://127.0.0.1:26003/xiaozhi/v1/"
 
 async def main():
     async with websockets.connect(URL, additional_headers={"device-id": "aa:bb:cc:dd:ee:ff", "client-id": "test-client"}) as ws:

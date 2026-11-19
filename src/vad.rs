@@ -4,7 +4,8 @@ use crate::config::VadCfg;
 pub enum VadEvent {
     None,
     StartSpeech,
-    EndSpeech,
+    /// 说话结束；`true` 表示碰到录音上限而不是自然静音。
+    EndSpeech(bool),
 }
 
 /// 纯能量门限 VAD：替代本地 Silero 模型，全云端部署时用不到任何本地推理
@@ -66,16 +67,48 @@ impl EnergyVad {
             self.silent += 1;
         }
         if self.silent >= self.end_frames || self.frames >= self.max_frames {
+            let capped = self.frames >= self.max_frames;
             self.speaking = false;
             self.voiced = 0;
             self.silent = 0;
-            return VadEvent::EndSpeech;
+            return VadEvent::EndSpeech(capped);
         }
         VadEvent::None
     }
 }
 
 const MAX_SPEECH_SECS: u32 = 20;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> VadCfg {
+        VadCfg {
+            rms_threshold: 500.0,
+            start_frames: 1,
+            end_frames: 1,
+        }
+    }
+
+    #[test]
+    fn silence_and_the_cap_end_differently() {
+        let mut vad = EnergyVad::new(&cfg(), 60);
+        assert_eq!(vad.push(&[2000; 960]), VadEvent::StartSpeech);
+        assert_eq!(vad.push(&[0; 960]), VadEvent::EndSpeech(false));
+
+        let mut vad = EnergyVad::new(&cfg(), 60);
+        assert_eq!(vad.push(&[2000; 960]), VadEvent::StartSpeech);
+        let mut last = VadEvent::None;
+        for _ in 0..MAX_SPEECH_SECS * 1000 / 60 {
+            last = vad.push(&[2000; 960]);
+            if last != VadEvent::None {
+                break;
+            }
+        }
+        assert_eq!(last, VadEvent::EndSpeech(true));
+    }
+}
 
 pub fn rms(pcm: &[i16]) -> f64 {
     if pcm.is_empty() {

@@ -128,7 +128,7 @@ struct ToolSpec {
 }
 const READ_TOOLS: [ReadTool; 3] = [
     ReadTool { name: "self.get_current_time", alias: "get_current_time", description: "读取设备本地当前时间。无参数；synchronized=false 时只能报告未对时，不可猜测时间。" },
-    ReadTool { name: "self.get_weather_forecast", alias: "get_weather_forecast", description: "只读取设备最近成功天气缓存（5天和21小时）、城市、UTC偏移、fetched_at/fetched_at_known、age/stale/retrying；不会发起新天气请求。age为设备单调时钟计量的秒数，不能用于推算绝对抓取时间。天气码为WMO；降水概率单位为百分比（0..100），不是实时降水观测。21条小时序列以缓存抓取时的当地小时为基准，等待期间不滚动。说明缓存是否陈旧或抓取时间未知；无缓存时如实报告不可用。" },
+    ReadTool { name: "self.get_weather_forecast", alias: "get_weather_forecast", description: "只读取设备最近成功天气缓存（5天和21小时）、城市、UTC偏移、fetched_at/fetched_at_known、age/stale/retrying；不会发起新天气请求。age为设备单调时钟计量的秒数，不能用于推算绝对抓取时间。天气码为WMO；降水概率单位为百分比（0..100），不是实时降水观测。21条逐时数据保留抓取顺序，不随时间滚动；新版设备每条提供当地日期和小时。说明缓存是否陈旧或抓取时间未知；无缓存时如实报告不可用。" },
     ReadTool { name: "self.get_sensor_reading", alias: "get_sensor_reading", description: "只读取设备实际本地温湿度传感器。available=false 时报告无读数，禁止用天气预报温湿度代替。" },
 ];
 
@@ -401,6 +401,15 @@ impl DeviceMcp {
             .context("tool is not allowed")?;
         if tool.reading {
             ensure!(args.is_empty(), "tool takes no arguments");
+        } else if tool.name == "self.audio_speaker.set_volume" {
+            ensure!(
+                args.len() == 1
+                    && args
+                        .get("volume")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|volume| volume <= 100),
+                "volume must be an integer from 0 to 100"
+            );
         }
         let mut params = CallToolRequestParams::new(tool.name.clone());
         params.arguments = Some(args.clone());

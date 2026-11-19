@@ -424,8 +424,14 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                         }
                         pre_roll.push_back(pcm);
                     }
-                    VadEvent::EndSpeech => {
-                        info!("检测到说话结束");
+                    VadEvent::EndSpeech(capped) => {
+                        // 设备本地端点（约 660 ms 静音）比服务端能量门限准，由它的
+                        // listen stop 收尾；这里只在上限（一直有声音）时强制截断。
+                        if !capped {
+                            info!("检测到停顿，等待设备结束录音");
+                            continue;
+                        }
+                        info!("输入达到录音上限，强制结束");
                         listening = false;
                         if asr_tx.try_send(AsrCmd::Pcm(pcm)).is_err()
                             || asr_tx.try_send(AsrCmd::Flush).is_err()

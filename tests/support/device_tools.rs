@@ -183,6 +183,26 @@ async fn action_tools_forward_arguments_and_accept_plain_text_results() {
     let mut rig = Rig::new();
     rig.discover(vec![vec![volume_tool(), tool(NAMES[0])]])
         .await;
+    for invalid in [
+        "{}",
+        r#"{"volume":"35"}"#,
+        r#"{"volume":35.5}"#,
+        r#"{"volume":false}"#,
+        r#"{"volume":-1}"#,
+        r#"{"volume":101}"#,
+        r#"{"volume":35,"extra":true}"#,
+    ] {
+        assert!(rig
+            .device
+            .call(
+                "self_audio_speaker_set_volume",
+                invalid,
+                &CancellationToken::new()
+            )
+            .await
+            .is_err());
+        assert!(rig.outgoing.try_recv().is_err());
+    }
     let device = rig.device.clone();
     let arguments = "{\"volume\":35}";
     let call = tokio::spawn(async move {
@@ -241,7 +261,7 @@ async fn calls_three_tools_and_preserves_full_cache_metadata() {
     let mut rig = Rig::all().await;
     let values = [
         json!({"synchronized":true,"local_time":"2026-11-17T16:00:00+08:00"}),
-        json!({"available":true,"city":"杭州","utc_offset_seconds":28800,"fetched_at":"2026-11-17T15:00:00+08:00","age":3600,"stale":true,"retrying":true,"days":vec![json!({"date":"demo"});5],"hours":vec![json!({"temperature_c":12.5});21]}),
+        json!({"available":true,"city":"杭州","utc_offset_seconds":28800,"fetched_at":"2026-11-17T15:00:00+08:00","age":3600,"stale":true,"retrying":true,"days":vec![json!({"date":"demo"});5],"hours":vec![json!({"date":"2026-11-17","hour":15,"temperature_c":12.5});21]}),
         json!({"available":true,"temperature_c":23.5,"humidity_percent":58.0}),
     ];
     for (name, data) in NAMES.iter().zip(values) {
@@ -1758,4 +1778,89 @@ async fn two_opus_questions_reuse_context_and_end_the_session_once() {
     assert_eq!(requests.len(), 2);
     let history = requests[1]["messages"].as_array().unwrap();
     assert!(history.iter().any(|msg| msg["role"] == "assistant" && msg["content"] == "今天带伞。"));
+}
+
+/// A natural pause inside a question must not let the server's energy VAD finish the
+/// turn; the device's own endpoint sends `listen stop`.
+#[tokio::test]
+async fn mid_question_pause_waits_for_device_stop() {
+    let (cloud, _fake) = llm_server(vec![answer_sse("好的。")]).await;
+    let mut config = cfg(&cloud.url);
+    config.tts.api_url = format!("{}/tts", cloud.url);
+    config.vad.start_frames = 1;
+    config.vad.end_frames = 6; // 360 ms, shorter than the device's ~660 ms endpoint.
+    let asr = serve(Router::new().route(
+        "/asr",
+        get(|upgrade: axum::extract::ws::WebSocketUpgrade| async move {
+            upgrade.on_upgrade(|mut socket| async move {
+                if !matches!(socket.recv().await, Some(Ok(Message::Binary(_)))) {
+                    return;
+                }
+                let response = |json: Value| {
+                    let body = json.to_string().into_bytes();
+                    let mut bytes = vec![0x11, 0x90, 0x10, 0, 0, 0, 0, 0];
+                    bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
+                    bytes.extend_from_slice(&body);
+                    Message::Binary(bytes.into())
+                };
+                socket.send(response(json!({"code": 0}))).await.unwrap();
+                while let Some(Ok(Message::Binary(bytes))) = socket.recv().await {
+                    if bytes[1] & 0x0f == 0x02 {
+                        socket
+                            .send(response(json!({
+                                "result": {"utterances": [{"definite": true, "text": "明天会下雨吗？"}]}
+                            })))
+                            .await
+                            .unwrap();
+                    }
+                }
+            })
+        }),
+    ))
+    .await;
+    config.asr.ws_url = asr.url.replace("http://", "ws://") + "/asr";
+    let device = serve(
+        Router::new()
+            .route("/ws", get(crate::session::ws_handler))
+            .with_state(Arc::new(ConfigStore::new("unused".into(), config))),
+    )
+    .await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(device.url.replace("http://", "ws://") + "/ws")
+        .await
+        .unwrap();
+    ws_handshake(&mut ws).await;
+
+    ws_send(&mut ws, json!({"type":"listen","state":"start","mode":"auto"})).await;
+    let mut enc = crate::audio::OpusOut::new(16_000, 60).unwrap();
+    let loud: Vec<i16> = (0..960 * 3)
+        .map(|i| ((i as f32 * 0.18).sin() * 9000.0) as i16)
+        .collect();
+    for packet in enc.encode(&loud) {
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(packet.into())).await.unwrap();
+    }
+    // 12 silent frames = 720 ms, past end_frames but inside the device's own endpoint window.
+    for packet in enc.encode(&vec![0i16; 960 * 12]) {
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(packet.into())).await.unwrap();
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), ws.next()).await.is_err(),
+        "server must not answer before the device sends listen stop"
+    );
+
+    ws_send(&mut ws, json!({"type":"listen","state":"stop"})).await;
+    let mut stt = false;
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await.unwrap().unwrap().unwrap();
+        if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+            let msg: Value = serde_json::from_str(&text).unwrap();
+            if msg["type"] == "stt" {
+                assert_eq!(msg["text"], "明天会下雨吗？");
+                stt = true;
+            } else if msg["type"] == "tts" && msg["state"] == "stop" {
+                assert!(stt, "stop before stt");
+                break;
+            }
+        }
+    }
 }
