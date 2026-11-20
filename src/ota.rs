@@ -58,7 +58,7 @@ mod tests {
 
     #[test]
     fn ota_uses_configured_websocket_port() {
-        let mut cfg = Config::parse(include_str!("../config.toml")).unwrap();
+        let mut cfg = Config::parse(include_str!("../config.example.toml")).unwrap();
         cfg.server.ws_port = 9000;
         cfg.server.http_port = 9003;
         let info = response(&cfg, "1.0.0", Some("192.168.1.100:9003"));

@@ -577,7 +577,7 @@ mod tests {
             .unwrap();
         });
 
-        let mut cfg = crate::config::Config::parse(include_str!("../config.toml"))
+        let mut cfg = crate::config::Config::parse(include_str!("../config.example.toml"))
             .unwrap()
             .asr;
         cfg.speech_api_key = Some("test-voice-key".into());

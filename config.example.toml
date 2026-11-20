@@ -1,0 +1,35 @@
+# 复制为 config.local.toml，填入自己的模型和凭证后再启动。
+[log]
+level = "info"
+dir = "logs"
+keep = 2
+max_mb = 50
+
+[server]
+ws_port = 26003
+http_port = 8000
+
+[vad]
+rms_threshold = 500
+start_frames = 2
+end_frames = 6
+
+[llm]
+base_url = "https://ark.cn-beijing.volces.com/api/v3"
+api_key = "你的方舟_API_Key"
+model = "你的方舟模型_ID"
+prompt = """
+你是一个名叫小鹿的智能助手。请用简短、自然的中文回答，适合直接朗读。
+"""
+
+[speech]
+# 同一个豆包语音项目的 API Key 用于 ASR 和 TTS。
+api_key = "你的豆包语音_API_Key"
+
+[asr]
+# 按项目开通的计费方式选择 duration 或 concurrent。
+resource_id = "volc.seedasr.sauc.duration"
+
+[tts]
+resource_id = "seed-tts-2.0"
+voice = "zh_female_xiaohe_uranus_bigtts"

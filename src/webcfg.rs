@@ -141,7 +141,7 @@ mod tests {
         fn new() -> Self {
             let path =
                 std::env::temp_dir().join(format!("xiaozhi-config-{}.toml", uuid::Uuid::new_v4()));
-            let text = include_str!("../config.toml");
+            let text = include_str!("../config.example.toml");
             std::fs::write(&path, text).unwrap();
             Self {
                 state: Arc::new(ConfigStore::new(
@@ -164,7 +164,7 @@ mod tests {
         let old = fixture.state.current();
         let text = format!(
             "# 网页保存保留注释\n{}",
-            include_str!("../config.toml").replace("ws_port = 26003", "ws_port = 9000")
+            include_str!("../config.example.toml").replace("ws_port = 26003", "ws_port = 9000")
         );
         let response = save(
             State(fixture.state.clone()),
@@ -202,7 +202,7 @@ mod tests {
             .contains("TOML 解析失败"));
         assert_eq!(
             std::fs::read_to_string(&fixture.state.path).unwrap(),
-            include_str!("../config.toml")
+            include_str!("../config.example.toml")
         );
         assert!(Arc::ptr_eq(&old, &fixture.state.current()));
     }

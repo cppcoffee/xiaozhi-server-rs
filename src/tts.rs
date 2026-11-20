@@ -247,7 +247,7 @@ mod tests {
         }
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut cfg = crate::config::Config::parse(include_str!("../config.toml"))
+        let mut cfg = crate::config::Config::parse(include_str!("../config.example.toml"))
             .unwrap()
             .tts;
         cfg.speech_api_key = Some("test-voice-key".into());

@@ -35,7 +35,11 @@
 
 ## 3. 配置
 
-配置文件使用 TOML，完整示例见仓库根目录 `config.toml`。文本模型和语音项目使用各自的凭证。
+将 [config.example.toml](config.example.toml) 复制为本地配置，再填入凭证和模型 ID。`config.local.toml` 已被 Git 忽略。
+
+```bash
+cp -n config.example.toml config.local.toml
+```
 
 | 位置 | 填什么 | 从哪拿 |
 |---|---|---|
@@ -87,10 +91,10 @@ voice = "zh_female_xiaohe_uranus_bigtts"
 
 ```bash
 # 自检方舟请求、ASR 模型初始化和 TTS 音频合成
-cargo run -- --check config.toml
+cargo run -- --check config.local.toml
 
 cargo build --release
-./target/release/xiaozhi-server-rs config.toml     # 默认读取 ./config.toml
+./target/release/xiaozhi-server-rs config.local.toml
 
 # 协议自测（hello / listen / ping / abort，不需要真实 key）
 python3 tests/check_ws.py

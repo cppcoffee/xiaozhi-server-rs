@@ -296,12 +296,15 @@ voice = "test-voice"
 
     #[test]
     fn example_toml_parses() {
-        let cfg = Config::parse(include_str!("../config.toml")).unwrap();
+        let cfg = Config::parse(include_str!("../config.example.toml")).unwrap();
         assert_eq!(cfg.server.ws_port, 26003);
         assert_eq!(cfg.server.http_port, 8000);
         assert_eq!(cfg.vad.rms_threshold, 500.0);
         assert!(cfg.llm.prompt.contains("你是一个名叫小智的智能助手"));
         assert!(cfg.llm.prompt.ends_with('\n'));
+        assert!(credential_missing(&cfg.llm.api_key));
+        assert!(credential_missing(&cfg.llm.model));
+        assert!(credential_missing(cfg.asr.speech_api_key.as_deref().unwrap()));
         assert_eq!(cfg.tts.api_url, TTS_V3_URL);
     }
 
