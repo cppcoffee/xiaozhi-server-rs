@@ -28,7 +28,7 @@ fn shared_http_client() -> reqwest::Client {
         .clone()
 }
 
-/// 豆包 HTTP 语音合成。V3 支持边收分块边吐出 PCM，降低首音延迟。
+/// Doubao HTTP speech synthesis. V3 emits PCM chunk by chunk, lowering the first-sound latency.
 #[derive(Clone)]
 pub struct DoubaoTts {
     cfg: TtsCfg,
@@ -43,7 +43,7 @@ impl DoubaoTts {
         }
     }
 
-    /// V3 可按设备协商采样率直接输出（16k 省 33% 下载与编码）；V1 默认 24k。
+    /// V3 can output at the sample rate negotiated with the device (16k saves 33% download and encode); V1 defaults to 24k.
     pub fn preferred_sample_rate(&self, negotiated: u32) -> u32 {
         if self.cfg.speech_api_key.is_some() {
             match negotiated {
@@ -55,7 +55,7 @@ impl DoubaoTts {
         }
     }
 
-    /// 返回整句裸 PCM16（24k 单声道）字节；供测试和简单调用复用。
+    /// Return one whole sentence as raw PCM16 (24k mono) bytes; reused by tests and simple callers.
     #[allow(dead_code)]
     pub async fn synth(&self, text: &str) -> Result<Vec<u8>> {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
@@ -71,7 +71,7 @@ impl DoubaoTts {
         Ok(audio)
     }
 
-    /// 流式合成：每收到一块 PCM 立即写入 `tx`，无需等整句下载完成。
+    /// Streaming synthesis: each PCM chunk is written to `tx` as it arrives, without waiting for the whole sentence.
     pub async fn synth_stream(
         &self,
         text: &str,
@@ -266,10 +266,10 @@ async fn stream_v3_audio(
     Ok(())
 }
 
-/// 解析 TTS 返回：pcm 裸流直接用；wav 则跳过 RIFF 头
+/// Parse the TTS response: raw pcm is used as-is; wav skips the RIFF header
 pub fn strip_wav_header(data: &[u8]) -> Vec<u8> {
     if data.len() > 44 && &data[0..4] == b"RIFF" && &data[8..12] == b"WAVE" {
-        // 找 data chunk
+        // find the data chunk
         let mut i = 12;
         while i + 8 <= data.len() {
             let id = &data[i..i + 4];

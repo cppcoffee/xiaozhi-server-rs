@@ -223,7 +223,7 @@ MCP 复用官方 Rust SDK `rmcp`（Apache-2.0），SSE 帧解析复用 `eventsou
 字段约定（字段名区分大小写）：
 
 - **时间**：`{"synchronized":false}`；已对时则为 `{"synchronized":true,"local_time":"2026-11-17T16:30:00+08:00"}`。`local_time` 须为带 UTC 偏移的 RFC3339 / ISO 本地时间。ESP32 目前保守地只在**显式 SNTP 成功且已知天气 UTC 偏移**时声明 synchronized=true；将来若支持 OTA 对时，由设备依据验证成功状态决定。Rust 仅信任设备显式状态，不从系统时钟、hello、天气抓取时间或服务器时间推断已对时。
-- **传感器**：`{"available":false}`；可用时为 `{"available":true,"temperature_c":23.5,"humidity_percent":58}`。必须是设备本地实际采样，数值有限，湿度 0..100；不能借用天气 API 的温湿度。
+- **传感器**：`{"available":false}`；可用时返回设备实测的 `temperature_c`、`humidity_percent` 和可选的 `pressure_hpa`。新版固件还返回 `sampled_at`（带偏移的 RFC3339 时间，采样时未对时则为 null）与 `sample_age_seconds`（从采样到取用的单调计时秒数）。旧版固件省略时间字段时仍可使用读数。
 - **天气**：无缓存时 `{"available":false}`；有缓存时字段如下（`available:true` 可省略）：
 
 ```text
@@ -246,6 +246,12 @@ MCP 复用官方 Rust SDK `rmcp`（Apache-2.0），SSE 帧解析复用 `eventsou
 固定天气工具描述承载静态语义，不要求设备在每次结果中重复 `age_unit`、`weather_code_system`、`precip_probability_unit`、`hours_time_basis`：`age` 单位为秒，来自设备单调时钟；天气码采用 WMO；降水概率单位为百分比（0..100），不是实时降水观测；21 条逐时序列以该缓存抓取时的当地小时为基准，等待期间不滚动。四字段缺失不影响读数，旧设备继续携带也兼容；不改变发现的 metadata/inputSchema 或动态结果校验，尤其保留 `fetched_at_known`。
 
 **天气工具只读最近成功缓存，不发起任何新天气请求**；服务端也不新增天气 HTTP 客户端。获取失败仍应返回旧快照及真实 age/stale/retrying，不能以半成品覆盖。请求数据的 21 条逐时预报不能误裁成屏幕显示的 10 列。本地城市、UTC 偏移和 fetched_at 要属于同一个缓存快照。若客户端不知道快照的绝对抓取时间，保留完整缓存并显式返回 fetched_at=null / fetched_at_known=false；不能因此伪造时间或把已有缓存改报为不可用，也不能在后续对时后仅凭 age 推算补造原抓取时间。
+
+发给模型的天气结果会把 Unix 秒数和设备时区偏移转换成 `fetched_at_local`，便于区分缓存抓取时间与预报时点。
+
+### 扬声器音量
+
+用 `self.get_device_status` 查询 `audio_speaker.volume`。`self.audio_speaker.set_volume` 接受 0 到 100 的整数。新版固件在应用音量并写入 NVS 后返回 `volume`、`saved=true` 和 `applied_at`（未对时时为 null），下次开机初始化音频时恢复保存值。
 
 ### 模型调用与缺失数据保护
 

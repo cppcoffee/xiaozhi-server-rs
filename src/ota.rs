@@ -1,4 +1,4 @@
-/// OTA：设备请求 OTA 时告诉它连哪个 websocket，并给设备对时
+/// OTA: tells the device which websocket to connect to and syncs its clock
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -10,7 +10,7 @@ use tracing::info;
 use crate::config::{local_ip, Config, ConfigStore};
 use crate::protocol::utc_offset_secs;
 
-/// OTA 响应：websocket 地址按设备请求用的 Host 组装，时区取本机设置
+/// OTA response: websocket address built from the Host the device used, timezone from the local setting
 pub fn response(cfg: &Config, device_version: &str, host: Option<&str>) -> Value {
     json!({
         "server_time": {
@@ -28,7 +28,7 @@ pub fn response(cfg: &Config, device_version: &str, host: Option<&str>) -> Value
     })
 }
 
-/// 设备从哪个地址访问 OTA，就用同一个主机名下发 websocket 地址
+/// Reply with the same hostname the device used to reach OTA
 fn ws_url(cfg: &Config, host: Option<&str>) -> String {
     let host = match host.and_then(bare_host) {
         Some(h) => h.to_string(),
@@ -37,7 +37,7 @@ fn ws_url(cfg: &Config, host: Option<&str>) -> String {
     format!("ws://{host}:{}/xiaozhi/v1/", cfg.server.ws_port)
 }
 
-/// Host 头去掉端口；IPv6 保留方括号
+/// Strip the port from the Host header; keep brackets for IPv6
 fn bare_host(host: &str) -> Option<&str> {
     let host = host.trim();
     if host.is_empty() {
@@ -77,7 +77,7 @@ mod tests {
     }
 }
 
-/// OTA 接口：设备从这里拿 websocket 地址和对时
+/// OTA endpoint: the device gets its websocket address and clock sync here
 pub async fn handler(
     State(state): State<Arc<ConfigStore>>,
     headers: HeaderMap,

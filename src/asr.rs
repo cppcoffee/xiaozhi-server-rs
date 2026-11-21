@@ -38,8 +38,8 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const ASR_PACKET_MS: u32 = 120;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Flush 后等最终结果的步数（100ms/步）。豆包正常 <1s，给到 10s，
-/// 避免出结果慢一点就把整轮静默丢掉
+/// Steps to wait for the final result after flush (100ms/step). Doubao normally answers in <1s;
+/// 10s avoids dropping a whole turn just because the result was a bit slow
 const FLUSH_WAIT_STEPS: usize = 100;
 
 fn gzip(data: &[u8]) -> Result<Vec<u8>> {
@@ -86,7 +86,7 @@ fn frame(msg_type: u8, last: bool, sequence: Option<i32>, payload: &[u8]) -> Res
     Ok(buf)
 }
 
-/// 解析服务端返回帧
+/// Parse a server response frame
 fn parse_frame(res: &[u8], legacy: bool) -> Result<(Value, bool)> {
     ensure!(
         res.len() >= 4 && res[0] >> 4 == 1,
@@ -175,10 +175,10 @@ fn request_json(cfg: &AsrCfg, sample_rate: u32) -> Value {
     })
 }
 
-/// 从返回帧里挑出 definite 的语句文本
+/// Extract text from the definite utterances of a response frame
 fn extract_text(v: &Value) -> Option<String> {
     if let Some(code) = v.get("code").and_then(|c| c.as_i64()) {
-        // 1013：无有效语音，属正常
+        // 1013: no valid speech, which is normal
         if code == 1013 {
             return None;
         }
@@ -201,7 +201,7 @@ fn extract_text(v: &Value) -> Option<String> {
     }
 }
 
-/// ASR 长连接管理：懒连接、流式送音频、吐最终文本
+/// ASR long connection: lazy connect, stream audio, yield final text
 type AsrSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -365,7 +365,7 @@ impl DoubaoAsr {
     }
 }
 
-/// 非阻塞地取出 ws 上已到达的所有帧，返回可能出现的最终文本
+/// Drain every frame already received on the ws without blocking, returning any final text
 async fn drain_pending(asr: &mut DoubaoAsr, wait_ms: u64) -> Result<Option<String>> {
     let modern = asr.cfg.speech_api_key.is_some();
     let mut text = None;
@@ -539,7 +539,7 @@ async fn read_result(asr: &mut DoubaoAsr, cmd: AsrCmd) -> Option<String> {
     }
 }
 
-/// `--check` 用：完成握手和模型初始化，验证鉴权及资源 ID。
+/// Used by `--check`: complete handshake and model init to verify auth and resource ID.
 pub async fn probe(cfg: &crate::config::AsrCfg, sample_rate: u32) -> Result<String> {
     let mut asr = DoubaoAsr::new(cfg.clone(), sample_rate);
     asr.connect().await?;

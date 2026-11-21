@@ -25,22 +25,22 @@ use crate::text::clean_for_tts;
 use crate::tts::DoubaoTts;
 use crate::vad::{EnergyVad, VadEvent};
 
-/// 保留最近多少轮对话上下文
+/// How many recent conversation rounds to keep
 const HISTORY_ROUNDS: usize = 6;
 
-/// 多久没有任何消息就断开这条连接（设备待机时只有唤醒才发消息）
+/// Close the connection after this long without any message (an idle device only sends on wake)
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// 播放起步预缓冲帧数：首 2 帧（120ms）免休眠连发，给 ESP32 建立抖动缓冲
+/// Playback start pre-buffer frames: send the first 2 frames (120ms) back-to-back to build the ESP32 jitter buffer
 const PRE_BUFFER_FRAMES: usize = 2;
 const OUTPUT_FRAME_MS: u32 = 60;
 const OUTPUT_FRAME_INTERVAL: Duration = Duration::from_millis(OUTPUT_FRAME_MS as u64);
 
-/// 历史消息中过长的旧工具结果在后续轮次中省略，减少无谓 prefill 耗时
+/// Oversized old tool results are omitted from later rounds to avoid pointless prefill time
 const COMPACT_TOOL_HISTORY_BYTES: usize = 512;
 
-/// 服务端静音兜底时长：若设备本地端点漏检导致迟迟不发 listen stop，
-/// 说话后连续静音达到该阈值即主动结束本轮并触发识别，避免死等设备 15s 超时。
+/// Server-side silence fallback: if the device misses its local endpoint and never sends listen stop,
+/// this much consecutive silence after speech ends the turn and triggers recognition instead of waiting out the device's 15s timeout.
 const SERVER_SILENCE_FALLBACK_MS: u32 = 1200;
 
 // One absolute clock per accepted text turn; progress never renews these limits.
@@ -149,7 +149,7 @@ impl Shared {
     }
 }
 
-/// websocket 升级：每个连接一个会话
+/// websocket upgrade: one session per connection
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<crate::config::ConfigStore>>,
@@ -167,7 +167,7 @@ pub async fn ws_handler(
         })
 }
 
-/// 一条 websocket 连接的完整生命周期
+/// Full lifecycle of one websocket connection
 pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: String) {
     let session_id = Uuid::new_v4().to_string();
     info!("Device connected: device_id={device_id} session_id={session_id}");
@@ -180,7 +180,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
     let _connection_guard = closed.clone().drop_guard();
     let writer_closed = closed.clone();
 
-    // 写任务：所有出站消息统一排队，避免多任务竞争 socket
+    // Writer task: all outbound messages go through one queue, so tasks never race for the socket
     tokio::spawn(async move {
         let mut sink = sink;
         let mut ws_rx = ws_rx;
@@ -223,7 +223,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
         writer_closed.cancel();
     });
 
-    // ASR 通道
+    // ASR channel
     let (asr_tx, asr_rx) = mpsc::channel::<AsrCmd>(64);
     let (asr_out_tx, mut asr_out_rx) = mpsc::channel::<AsrOutcome>(8);
     let asr_cancel = CancellationToken::new();
@@ -295,7 +295,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
         })
     };
 
-    // 读任务
+    // Reader task
     let mut decoder = match OpusIn::new(crate::config::INPUT_SAMPLE_RATE) {
         Ok(d) => d,
         Err(e) => {
@@ -320,7 +320,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
             msg = stream.next() => msg,
             _ = tokio::time::sleep(IDLE_TIMEOUT) => {
                 if shared.turn_cancel.lock().await.is_some() {
-                    continue; // 正在回话，不算空闲
+                    continue; // a turn is running, so this is not idle
                 }
                 info!("Closing WebSocket after {} seconds of inactivity", IDLE_TIMEOUT.as_secs());
                 // Give the writer a chance to send Close before cancelling it.
@@ -503,8 +503,8 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                         pre_roll.push_back(pcm);
                     }
                     VadEvent::EndSpeech(capped) => {
-                        // 短停顿优先等设备本地端点发 listen stop，同时继续向 ASR 转发尾音；
-                        // 若超过服务端静音兜底（默认 1.2s）或 20s 录音上限，由服务端主动收尾。
+                        // On a short pause prefer the device's local listen stop while still forwarding the tail to ASR;
+                        // past the server silence fallback (1.2s default) or the 20s recording cap, the server ends the turn itself.
                         if !capped {
                             post_speech_silent_frames += 1;
                             if !manual_mode && post_speech_silent_frames >= fallback_frames {
@@ -686,7 +686,7 @@ async fn run_turn_inner(
     shared.send_tts_state("start", None).await;
 
     let (sentence_tx, mut sentence_rx) = mpsc::channel::<String>(16);
-    // 64 帧 ≈ 3.84 秒预取缓冲：播放第 N 句时并发预合成第 N+1 句，消除句间停顿
+    // 64 frames ≈ 3.84s prefetch buffer: sentence N+1 is synthesized while sentence N plays, removing gaps
     let (pacer_tx, pacer_rx) = mpsc::channel::<PacerItem>(64);
 
     let question = user_text.as_str();
@@ -702,7 +702,7 @@ async fn run_turn_inner(
             return Ok(vec![json!({"role":"assistant", "content":answer})]);
         }
 
-        // 历史中较大的旧工具结果只保留提示，降低模型 prefill 延迟。
+        // Large old tool results in history keep only a hint, reducing model prefill latency.
         let mut messages = Vec::new();
         if !shared.cfg.llm.prompt.trim().is_empty() {
             messages.push(json!({"role": "system", "content": shared.cfg.llm.prompt}));
@@ -807,7 +807,7 @@ async fn synthesize_sentence_to_pacer(
     Ok(())
 }
 
-/// 独立单调时钟流控器：前 2 帧免休眠预缓冲，后续 60ms 稳态发送，队列空停顿后自动重锚定防突发行。
+/// Pacer on an independent monotonic clock: the first 2 frames go out back-to-back, then a 60ms steady rate, and after an idle queue it re-anchors to avoid a burst.
 async fn run_audio_pacer(
     shared: &Arc<Shared>,
     mut pacer_rx: mpsc::Receiver<PacerItem>,
@@ -860,7 +860,7 @@ async fn run_audio_pacer(
     Ok(())
 }
 
-/// 失败/超时兜底单句播放（复用相同的流式编码与流控路径）
+/// Single-sentence fallback playback for failures/timeouts (reuses the same streaming encode and pacer path)
 async fn speak_single_sentence(
     shared: &Arc<Shared>,
     tts: &DoubaoTts,

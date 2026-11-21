@@ -1,7 +1,7 @@
-/// 小智 websocket 协议里用到的消息格式（与 Python 版逐字段对齐）
+/// Message formats used by the xiaozhi websocket protocol (field-for-field aligned with the Python version)
 use serde_json::{json, Value};
 
-/// 本机时区相对 UTC 的秒数，跟随操作系统设置
+/// Seconds the local timezone is offset from UTC, following the OS setting
 pub fn utc_offset_secs() -> i64 {
     chrono::Local::now().offset().local_minus_utc() as i64
 }

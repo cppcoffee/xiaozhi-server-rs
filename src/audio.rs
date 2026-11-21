@@ -2,7 +2,7 @@ use audiopus::coder::{Decoder, Encoder};
 use audiopus::packet::Packet;
 use audiopus::{Application, Bitrate, Channels, MutSignals, SampleRate, Signal};
 
-/// 设备上行：16k 单声道 Opus → PCM16
+/// Device uplink: 16k mono Opus -> PCM16
 pub struct OpusIn {
     dec: Decoder,
     buf: Vec<i16>,
@@ -31,7 +31,7 @@ impl OpusIn {
     }
 }
 
-/// 下行：PCM16（16k/24k）→ Opus 60ms 帧（支持边收 PCM 边出帧）
+/// Downlink: PCM16 (16k/24k) -> 60ms Opus frames (emits frames while PCM is still arriving)
 pub struct OpusOut {
     enc: Encoder,
     frame_samples: usize,
@@ -63,7 +63,7 @@ impl OpusOut {
         })
     }
 
-    /// 把任意长度的 PCM 切成 60ms 帧逐帧编码
+    /// Encode arbitrary-length PCM as 60ms frames
     #[allow(dead_code)]
     pub fn encode(&mut self, pcm: &[i16]) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
@@ -75,7 +75,7 @@ impl OpusOut {
         frames
     }
 
-    /// 补零到整帧后再编码（句尾用）
+    /// Zero-pad to a full frame, then encode (used at end of utterance)
     #[allow(dead_code)]
     pub fn encode_padded(&mut self, pcm: &[i16]) -> Vec<Vec<u8>> {
         let mut frames = self.encode(pcm);
@@ -90,7 +90,7 @@ impl OpusOut {
         frames
     }
 
-    /// 流式喂入小端 PCM16 字节，凑齐整帧立即编码返回
+    /// Feed little-endian PCM16 bytes; encode and return each completed frame
     pub fn push_pcm_bytes(&mut self, mut bytes: &[u8]) -> Vec<Vec<u8>> {
         if let Some(lo) = self.trailing_byte.take() {
             if let Some((&hi, rest)) = bytes.split_first() {
@@ -122,7 +122,7 @@ impl OpusOut {
         frames
     }
 
-    /// 句尾冲刷：把不足一帧的剩余样本补零编码
+    /// End-of-utterance flush: zero-pad the remaining samples into one frame
     pub fn finish_stream(&mut self) -> Option<Vec<u8>> {
         self.trailing_byte = None;
         if self.pending_pcm.is_empty() {

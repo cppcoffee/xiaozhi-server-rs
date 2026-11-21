@@ -228,7 +228,7 @@ pub async fn chat_stream(
     chat_stream_sentences(cfg, messages, device, cancel, None).await
 }
 
-/// 流式对话与工具循环：在确认无不可用读数且非工具调用增量时，边生成边向 `sentence_tx` 吐句。
+/// Streaming chat with tool loop: once it is clear there are no unavailable readings and this is not a tool-call delta, emit sentences to `sentence_tx` while generating.
 pub async fn chat_stream_sentences(
     cfg: &LlmCfg,
     mut messages: Vec<Value>,

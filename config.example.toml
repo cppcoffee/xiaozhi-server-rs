@@ -1,4 +1,4 @@
-# 复制为 config.local.toml，填入自己的模型和凭证后再启动。
+# Copy to config.local.toml, fill in your own model and credentials, then start.
 [log]
 level = "info"
 dir = "logs"
@@ -19,15 +19,17 @@ base_url = "https://ark.cn-beijing.volces.com/api/v3"
 api_key = "你的方舟_API_Key"
 model = "你的方舟模型_ID"
 prompt = """
-你是一个名叫小鹿的智能助手。请用简短、自然的中文回答，适合直接朗读。
+你是一个名叫小鹿的智能助手，性格可爱、活泼、乐于助人。
+回答要简短、口语化，控制在 60 字以内，不要使用 markdown、表情符号和括号注释。
+用户是用语音和你交流的，所以避免使用列表、序号，不要复述用户的问题。
 """
 
 [speech]
-# 同一个豆包语音项目的 API Key 用于 ASR 和 TTS。
+# One API key from the same Doubao speech project serves ASR and TTS.
 api_key = "你的豆包语音_API_Key"
 
 [asr]
-# 按项目开通的计费方式选择 duration 或 concurrent。
+# Choose duration or concurrent based on the billing mode enabled for the project.
 resource_id = "volc.seedasr.sauc.duration"
 
 [tts]

@@ -1,4 +1,4 @@
-/// 运行日志：同时写 stdout 和按大小切片的文件
+/// Runtime log: writes to stdout and to size-rotated files
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
@@ -62,7 +62,7 @@ impl<W: Write> Write for AsciiWriter<W> {
     }
 }
 
-/// 初始化日志：等级取 RUST_LOG 或配置，文件写到 log.dir（默认 ./logs）
+/// Init logging: level from RUST_LOG or config, files under log.dir (default ./logs)
 pub fn init(cfg: &LogCfg) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.level));
     let stdout = tracing_subscriber::fmt::layer()
@@ -91,7 +91,7 @@ pub fn init(cfg: &LogCfg) {
         .init();
 }
 
-/// 异步文件写入器：把磁盘写与轮转挪到独立后台线程，避免阻塞 Tokio 工作线程。
+/// Async file writer: moves disk writes and rotation to a background thread so Tokio workers are not blocked.
 #[derive(Clone)]
 struct AsyncFileWriter {
     tx: Arc<SyncSender<Vec<u8>>>,
@@ -146,7 +146,7 @@ impl Drop for AsyncGuard {
     }
 }
 
-/// 超过 max_bytes 就把 当前→.1、.1→.2 …，只保留 keep 个文件
+/// Past max_bytes rotate current -> .1, .1 -> .2 ..., keeping only `keep` files
 pub struct RotatingFile {
     path: PathBuf,
     max_bytes: u64,

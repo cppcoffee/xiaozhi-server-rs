@@ -37,7 +37,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> anyhow::Result<ExitCode> {
-    // 参数：可选 config 路径 + --check（只校验凭证，不启动服务）
+    // Args: optional config path + --check (only verify credentials, do not start the server)
     let mut path = "config.toml".to_string();
     let mut do_check = false;
     for a in std::env::args().skip(1) {
@@ -99,6 +99,3 @@ async fn run() -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(test)]
-#[path = "../tests/support/device_tools.rs"]
-mod device_tools;

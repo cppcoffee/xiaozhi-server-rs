@@ -4,11 +4,11 @@ use crate::config::VadCfg;
 pub enum VadEvent {
     None,
     StartSpeech,
-    /// 说话结束；`true` 表示碰到录音上限而不是自然静音。
+    /// Speech ended; `true` means the recording cap was hit instead of natural silence.
     EndSpeech(bool),
 }
 
-/// 纯能量门限 VAD：替代本地 Silero 模型，全云端部署时用不到任何本地推理
+/// Pure energy-threshold VAD: replaces the local Silero model, so all-cloud deployments need no local inference
 pub struct EnergyVad {
     threshold: f64,
     start_frames: u32,
@@ -22,7 +22,7 @@ pub struct EnergyVad {
 
 impl EnergyVad {
     pub fn new(cfg: &VadCfg, frame_ms: u32) -> Self {
-        // 最长一句（设备只上传 15s，这里兜住“一直有噪声”的情况）
+        // Longest utterance (the device uploads at most 15s; this covers constant noise)
         let max_frames = MAX_SPEECH_SECS * 1000 / frame_ms.max(1);
         Self {
             threshold: cfg.rms_threshold,
@@ -64,7 +64,7 @@ impl EnergyVad {
             return (VadEvent::None, level);
         }
 
-        // 说话中
+        // Speaking
         self.frames += 1;
         if voiced {
             self.silent = 0;

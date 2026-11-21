@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use serde::Deserialize;
 
-/// 与设备固件约定的上行音频：16 kHz 单声道、60 ms 一帧 Opus（见 weather-esp32/main/voice.c）
+/// Uplink audio fixed by the device firmware: 16 kHz mono, one Opus frame per 60 ms (see weather-esp32/main/voice.c)
 pub const INPUT_SAMPLE_RATE: u32 = 16_000;
 pub const INPUT_FRAME_MS: u32 = 60;
 
@@ -69,7 +69,7 @@ fn d_max_mb() -> u64 {
     50
 }
 
-/// 运行日志：等级、目录、保留文件数、单文件上限
+/// Runtime log: level, directory, files to keep, max size per file
 #[derive(Debug, Clone, Deserialize)]
 pub struct LogCfg {
     #[serde(default = "d_level")]
@@ -103,8 +103,8 @@ fn d_end_frames() -> u32 {
     6
 }
 
-/// 纯能量门限 VAD：只决定何时开始/停止上传音频；整轮由设备 listen stop 或 20 秒上限结束。
-/// 环境噪声大就调高 rms_threshold，说话识别不到调低
+/// Pure energy-threshold VAD: only decides when to start/stop uploading audio; a turn ends on device listen stop or the 20s cap.
+/// Raise rms_threshold for noisy rooms, lower it when speech is missed
 #[derive(Debug, Clone, Deserialize)]
 pub struct VadCfg {
     #[serde(default = "d_rms")]
@@ -149,7 +149,7 @@ fn d_asr_resource() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AsrCfg {
-    /// 留着可指向本地假 ASR 做联调；默认豆包
+    /// Can point at a local fake ASR for integration testing; Doubao by default
     #[serde(default = "d_asr_url")]
     pub ws_url: String,
     #[serde(skip)]
@@ -158,7 +158,7 @@ pub struct AsrCfg {
     pub appid: String,
     #[serde(default)]
     pub access_token: String,
-    /// 并发版换成 volc.seedasr.sauc.concurrent
+    /// Switch to volc.seedasr.sauc.concurrent for the concurrent edition
     #[serde(default = "d_asr_resource")]
     pub resource_id: String,
 }
@@ -179,7 +179,7 @@ fn d_tts_resource() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TtsCfg {
-    /// 留着可指向本地假 TTS 做联调；默认豆包
+    /// Can point at a local fake TTS for integration testing; Doubao by default
     #[serde(default = "d_tts_url")]
     pub api_url: String,
     #[serde(skip)]
@@ -188,7 +188,7 @@ pub struct TtsCfg {
     pub appid: String,
     #[serde(default)]
     pub access_token: String,
-    /// 当前项目可用的音色 ID
+    /// Voice IDs available to this project
     pub voice: String,
     #[serde(default = "d_cluster")]
     pub cluster: String,
@@ -214,7 +214,7 @@ impl Config {
         Self::parse(&std::fs::read_to_string(path)?)
     }
 
-    /// welcome：协议常量 + 设备 hello 里声明的音频参数 + session_id
+    /// welcome: protocol constants + audio params declared in device hello + session_id
     pub fn welcome(&self, session_id: &str, hello: &serde_json::Value) -> serde_json::Value {
         let mut w = serde_json::json!({
             "type": "hello",
@@ -230,14 +230,14 @@ impl Config {
     }
 }
 
-/// 探测本机局域网 IP：只在 OTA 请求缺 Host 头时兜底
+/// Detect the local LAN IP: only a fallback when the OTA request has no Host header
 pub fn local_ip() -> String {
     local_ip_address::local_ip()
         .map(|ip| ip.to_string())
         .unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
-/// 当前配置 + 文件路径；网页保存后热替换，新连接生效
+/// Current config + file path; the web page hot-swaps it, new connections pick it up
 pub struct ConfigStore {
     pub path: String,
     cfg: RwLock<Arc<Config>>,
@@ -255,7 +255,7 @@ impl ConfigStore {
         self.cfg.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// 先写临时文件再改名，避免把正在用的 config.toml 写坏
+    /// Write a temp file first, then rename, so the live config.toml is never corrupted
     pub fn replace(&self, text: &str, mut next: Config) -> anyhow::Result<()> {
         let tmp = format!("{}.{}.tmp", self.path, uuid::Uuid::new_v4());
         let mut current = self.cfg.write().unwrap_or_else(|e| e.into_inner());

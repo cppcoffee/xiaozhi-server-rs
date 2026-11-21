@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::logging::ascii;
 use crate::tts::DoubaoTts;
 
-/// `--check`：验证三个云端接口，不启动设备服务。
+/// `--check`: verify the three cloud endpoints without starting the device server.
 pub async fn run(cfg: &Config) -> bool {
     println!("=== Xiaozhi Rust server credential check ===\n");
     let llm_ok = report("LLM (Ark)", check_llm(cfg).await);
@@ -79,7 +79,7 @@ async fn check_tts(cfg: &Config) -> Result<String> {
             "No audio returned. Check that the project has access to the configured voice."
         );
     }
-    // 24k 单声道 16bit
+    // 24k mono 16bit
     let ms = pcm.len() as f64 / (24000.0 * 2.0) * 1000.0;
     Ok(format!(
         "Synthesized {} bytes (about {:.0} ms of audio) with voice={}",

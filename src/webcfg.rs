@@ -1,4 +1,4 @@
-/// 浏览器配置页：GET 显示 config.toml 原文，POST 校验后写回（注释原样保留）
+/// Browser config page: GET shows config.toml verbatim, POST validates then writes it back (comments preserved)
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -114,10 +114,10 @@ fn render(status: StatusCode, text: &str, message: &str) -> Response {
     (status, Html(page)).into_response()
 }
 
-/// 挡掉别的网站借浏览器发起的跨站提交
+/// Reject cross-site submissions made through someone else's browser
 fn same_origin(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
-        return true; // curl 等工具不带 Origin
+        return true; // tools like curl send no Origin
     };
     let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) else {
         return false;

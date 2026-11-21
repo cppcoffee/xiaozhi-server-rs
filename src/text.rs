@@ -1,21 +1,21 @@
-/// 文本处理：流式切句 + TTS 前的清洗
+/// Text processing: streaming sentence splitting + cleanup before TTS
 use tracing::warn;
 
-/// 用户主动结束会话的说法（整句匹配，标点忽略）
+/// Phrases where the user ends the session (whole-sentence match, punctuation ignored)
 pub fn is_exit(text: &str) -> bool {
     const EXIT: [&str; 4] = ["退下", "退下吧", "再见", "拜拜"];
     let t = text.trim().trim_end_matches(['。', '！', '？', '!', '?', '.', '，', ',', ' ']);
     EXIT.contains(&t)
 }
 
-/// 按中文标点切句，用于边生成边合成
+/// Split on Chinese punctuation so text can be synthesized while it is generated
 #[allow(dead_code)]
 pub fn split_sentences(buf: &mut String, force: bool) -> Vec<String> {
     let mut is_first = false;
     split_sentences_streaming(buf, &mut is_first, force)
 }
 
-/// 流式切句：首句允许按逗号/顿号快速切分以压低 TTFA，后续按句末标点自然断句。
+/// Streaming split: the first sentence may be cut at commas to lower TTFA, later ones break on sentence-final punctuation.
 pub fn split_sentences_streaming(buf: &mut String, is_first: &mut bool, force: bool) -> Vec<String> {
     const ENDS: [char; 8] = ['。', '！', '？', '!', '?', '；', ';', '\n'];
     const SOFT: [char; 4] = ['，', ',', '、', '：'];
@@ -63,7 +63,7 @@ pub fn split_sentences_streaming(buf: &mut String, is_first: &mut bool, force: b
             out.push(rest);
         }
     } else if buf.chars().count() >= 40 {
-        // 没有句末标点时优先在逗号处切分，否则按长度兜底切分，避免长时间不出声
+        // No sentence-final punctuation: prefer a comma cut, else cut by length so playback does not stall
         let soft_cut = buf
             .char_indices()
             .enumerate()
@@ -88,7 +88,7 @@ pub fn split_sentences_streaming(buf: &mut String, is_first: &mut bool, force: b
     out
 }
 
-/// 过滤 markdown / emoji，避免 TTS 念出符号
+/// Strip markdown / emoji so TTS does not read symbols aloud
 pub fn clean_for_tts(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
