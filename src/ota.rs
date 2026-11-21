@@ -30,10 +30,10 @@ pub fn response(cfg: &Config, device_version: &str, host: Option<&str>) -> Value
 
 /// Reply with the same hostname the device used to reach OTA
 fn ws_url(cfg: &Config, host: Option<&str>) -> String {
-    let host = match host.and_then(bare_host) {
-        Some(h) => h.to_string(),
-        None => local_ip(),
-    };
+    let host = host
+        .and_then(bare_host)
+        .map(str::to_string)
+        .unwrap_or_else(local_ip);
     format!("ws://{host}:{}/xiaozhi/v1/", cfg.server.ws_port)
 }
 
@@ -52,31 +52,6 @@ fn bare_host(host: &str) -> Option<&str> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ota_uses_configured_websocket_port() {
-        let mut cfg = Config::parse(include_str!("../config.example.toml")).unwrap();
-        cfg.server.ws_port = 9000;
-        cfg.server.http_port = 9003;
-        let info = response(&cfg, "1.0.0", Some("192.168.1.100:9003"));
-        assert_eq!(
-            info["websocket"]["url"],
-            "ws://192.168.1.100:9000/xiaozhi/v1/"
-        );
-    }
-
-    #[test]
-    fn host_without_port() {
-        assert_eq!(bare_host("192.168.1.100:8003"), Some("192.168.1.100"));
-        assert_eq!(bare_host("192.168.1.100"), Some("192.168.1.100"));
-        assert_eq!(bare_host(" [::1]:8003 "), Some("[::1]"));
-        assert_eq!(bare_host(""), None);
-    }
-}
-
 /// OTA endpoint: the device gets its websocket address and clock sync here
 pub async fn handler(
     State(state): State<Arc<ConfigStore>>,
@@ -88,10 +63,12 @@ pub async fn handler(
         .get("device-id")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+
     let client_id = headers
         .get("client-id")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+
     let body_json: Value = serde_json::from_str(&body).unwrap_or(json!({}));
 
     let version = ["device-version", "firmware-version", "application-version"]

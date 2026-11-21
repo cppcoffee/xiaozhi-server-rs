@@ -5,6 +5,8 @@ use std::sync::{Arc, RwLock};
 
 use serde::Deserialize;
 
+use crate::error::ConfigError;
+
 /// Uplink audio fixed by the device firmware: 16 kHz mono, one Opus frame per 60 ms (see weather-esp32/main/voice.c)
 pub const INPUT_SAMPLE_RATE: u32 = 16_000;
 pub const INPUT_FRAME_MS: u32 = 60;
@@ -197,7 +199,7 @@ pub struct TtsCfg {
 }
 
 impl Config {
-    pub fn parse(text: &str) -> anyhow::Result<Self> {
+    pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let mut cfg: Self = toml::from_str(text)?;
         if let Some(speech) = cfg.speech.take() {
             let key: Arc<str> = Arc::from(speech.api_key.trim());
@@ -210,7 +212,7 @@ impl Config {
         Ok(cfg)
     }
 
-    pub fn load(path: &str) -> anyhow::Result<Self> {
+    pub fn load(path: &str) -> Result<Self, ConfigError> {
         Self::parse(&std::fs::read_to_string(path)?)
     }
 
@@ -256,7 +258,7 @@ impl ConfigStore {
     }
 
     /// Write a temp file first, then rename, so the live config.toml is never corrupted
-    pub fn replace(&self, text: &str, mut next: Config) -> anyhow::Result<()> {
+    pub fn replace(&self, text: &str, mut next: Config) -> Result<(), ConfigError> {
         let tmp = format!("{}.{}.tmp", self.path, uuid::Uuid::new_v4());
         let mut current = self.cfg.write().unwrap_or_else(|e| e.into_inner());
         let mut options = std::fs::OpenOptions::new();
@@ -304,7 +306,9 @@ voice = "test-voice"
         assert!(cfg.llm.prompt.ends_with('\n'));
         assert!(credential_missing(&cfg.llm.api_key));
         assert!(credential_missing(&cfg.llm.model));
-        assert!(credential_missing(cfg.asr.speech_api_key.as_deref().unwrap()));
+        assert!(credential_missing(
+            cfg.asr.speech_api_key.as_deref().unwrap()
+        ));
         assert_eq!(cfg.tts.api_url, TTS_V3_URL);
     }
 

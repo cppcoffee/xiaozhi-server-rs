@@ -1,5 +1,7 @@
 use crate::config::VadCfg;
 
+const MAX_SPEECH_SECS: u32 = 20;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum VadEvent {
     None,
@@ -81,8 +83,6 @@ impl EnergyVad {
         (VadEvent::None, level)
     }
 }
-
-const MAX_SPEECH_SECS: u32 = 20;
 
 #[cfg(test)]
 mod tests {

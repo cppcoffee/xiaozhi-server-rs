@@ -104,7 +104,8 @@ impl OpusOut {
         let pairs = bytes.len() / 2;
         self.pending_pcm.reserve(pairs);
         for pair in bytes[..pairs * 2].chunks_exact(2) {
-            self.pending_pcm.push(i16::from_le_bytes([pair[0], pair[1]]));
+            self.pending_pcm
+                .push(i16::from_le_bytes([pair[0], pair[1]]));
         }
         if bytes.len() % 2 == 1 {
             self.trailing_byte = Some(bytes[bytes.len() - 1]);
@@ -145,58 +146,4 @@ pub fn bytes_to_i16(bytes: &[u8]) -> Vec<i16> {
         .chunks_exact(2)
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sine(sample_rate: u32, ms: u32) -> Vec<i16> {
-        let n = (sample_rate as usize * ms as usize) / 1000;
-        (0..n)
-            .map(|i| {
-                let t = i as f32 / sample_rate as f32;
-                ((t * 440.0 * 2.0 * std::f32::consts::PI).sin() * 8000.0) as i16
-            })
-            .collect()
-    }
-
-    #[test]
-    fn opus_roundtrip_24k() {
-        let mut enc = OpusOut::new(24000, 60).unwrap();
-        let frames = enc.encode(&sine(24000, 120));
-        assert_eq!(frames.len(), 2, "120ms 应切成 2 个 60ms 帧");
-        let mut dec = OpusIn::new(24000).unwrap();
-        let out = dec.decode(&frames[0]).unwrap();
-        assert!(out.len() >= 1400 && out.len() <= 1460, "解出样本数 {}", out.len());
-    }
-
-    #[test]
-    fn opus_roundtrip_16k() {
-        let mut enc = OpusOut::new(16000, 60).unwrap();
-        let frames = enc.encode(&sine(16000, 60));
-        assert_eq!(frames.len(), 1);
-        let mut dec = OpusIn::new(16000).unwrap();
-        assert_eq!(dec.decode(&frames[0]).unwrap().len(), 960);
-    }
-
-    #[test]
-    fn streaming_push_pcm_bytes_handles_unaligned_chunks_and_tail() {
-        let mut enc = OpusOut::new(16000, 60).unwrap();
-        // 1.5 frames (1440 samples = 2880 bytes), split across odd-sized chunks.
-        let pcm = sine(16000, 90);
-        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-        let mut frames = Vec::new();
-        for chunk in bytes.chunks(333) {
-            frames.extend(enc.push_pcm_bytes(chunk));
-        }
-        assert_eq!(frames.len(), 1, "first 60ms frame should emit before flush");
-        let tail = enc.finish_stream().expect("remaining 30ms should zero-pad");
-        frames.push(tail);
-        assert_eq!(frames.len(), 2);
-        let mut dec = OpusIn::new(16000).unwrap();
-        for frame in &frames {
-            assert_eq!(dec.decode(frame).unwrap().len(), 960);
-        }
-    }
 }

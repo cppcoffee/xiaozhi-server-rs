@@ -90,11 +90,8 @@ voice = "zh_female_xiaohe_uranus_bigtts"
 ## 4. 运行与自测
 
 ```bash
-# 自检方舟请求、ASR 模型初始化和 TTS 音频合成
-cargo run -- --check config.local.toml
-
 cargo build --release
-./target/release/xiaozhi-server-rs config.local.toml
+./target/release/xiaozhi-server-rs -c config.local.toml
 
 # 协议自测（hello / listen / ping / abort，不需要真实 key）
 python3 tests/check_ws.py

@@ -18,6 +18,8 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+thiserror = "2"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 html-escape = "0.2"
@@ -25,6 +27,7 @@ local-ip-address = "0.6"
 bytes = "1"
 libc = "0.2"
 tokio-util = "0.7"
+clap = { version = "4", features = ["derive"] }
 
 # MCP protocol/lifecycle stays in the official Rust SDK; only XiaoZhi framing is local.
 rmcp = { version = "=3.10.0", default-features = false, features = ["client"] }

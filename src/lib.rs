@@ -1,7 +1,7 @@
 mod asr;
 mod audio;
-pub mod check;
 pub mod config;
+pub mod error;
 mod llm;
 pub mod logging;
 mod mcp;
@@ -16,13 +16,13 @@ mod webcfg;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::Context;
 use axum::routing::{get, post};
 use axum::serve::ListenerExt;
 use axum::Router;
-use tracing::{info, warn};
+use tracing::info;
 
 pub use config::{Config, ConfigStore};
+pub use error::{ConfigError, ServerError};
 
 pub fn build_router(state: Arc<ConfigStore>) -> Router {
     Router::new()
@@ -34,14 +34,11 @@ pub fn build_router(state: Arc<ConfigStore>) -> Router {
         .with_state(state)
 }
 
-pub async fn serve(cfg: Arc<Config>, config_path: impl Into<String>) -> anyhow::Result<()> {
+pub async fn serve(cfg: Arc<Config>, config_path: impl Into<String>) -> Result<(), ServerError> {
     info!(
         "Starting Xiaozhi Rust server: ws={} http={} llm={} asr={} tts={}",
         cfg.server.ws_port, cfg.server.http_port, cfg.llm.model, cfg.asr.resource_id, cfg.tts.voice
     );
-    if cfg.llm.api_key.contains("你的") {
-        warn!("llm.api_key is a placeholder. Set it to your Volcengine Ark API key.");
-    }
 
     let state = Arc::new(ConfigStore::new(config_path.into(), (*cfg).clone()));
     let app = build_router(state);
@@ -51,13 +48,19 @@ pub async fn serve(cfg: Arc<Config>, config_path: impl Into<String>) -> anyhow::
 
     let http_listener = tokio::net::TcpListener::bind(http_addr)
         .await
-        .with_context(|| format!("Failed to bind the OTA HTTP listener to {http_addr}"))?
+        .map_err(|source| ServerError::BindHttp {
+            addr: http_addr,
+            source,
+        })?
         .tap_io(|stream| {
             let _ = stream.set_nodelay(true);
         });
     let ws_listener = tokio::net::TcpListener::bind(ws_addr)
         .await
-        .with_context(|| format!("Failed to bind the WebSocket listener to {ws_addr}"))?
+        .map_err(|source| ServerError::BindWs {
+            addr: ws_addr,
+            source,
+        })?
         .tap_io(|stream| {
             let _ = stream.set_nodelay(true);
         });

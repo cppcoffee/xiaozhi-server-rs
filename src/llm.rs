@@ -257,7 +257,11 @@ pub async fn chat_stream_sentences(
                 round == MAX_TOOL_ROUNDS,
                 &mut ids,
                 live_tx,
-                if can_stream { turn.cache_warning() } else { None },
+                if can_stream {
+                    turn.cache_warning()
+                } else {
+                    None
+                },
             )
             .await?;
             if response.calls.is_empty() {

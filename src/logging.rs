@@ -4,10 +4,9 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::Mutex;
 
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -16,7 +15,6 @@ use tracing_subscriber::EnvFilter;
 use crate::config::LogCfg;
 
 const FILE_NAME: &str = "xiaozhi.log";
-const ASYNC_LOG_QUEUE: usize = 1024;
 
 pub fn ascii(text: &str) -> Cow<'_, str> {
     if text.is_ascii() {
@@ -63,18 +61,23 @@ impl<W: Write> Write for AsciiWriter<W> {
 }
 
 /// Init logging: level from RUST_LOG or config, files under log.dir (default ./logs)
-pub fn init(cfg: &LogCfg) {
+pub fn init(cfg: &LogCfg) -> Option<WorkerGuard> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.level));
     let stdout = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_writer(AsciiWriter(io::stdout));
     let max_bytes = cfg.max_mb.saturating_mul(1024 * 1024);
+    let mut guard = None;
     let files = match RotatingFile::new(&cfg.dir, cfg.keep, max_bytes) {
-        Ok(w) => Some(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(AsciiWriter(AsyncFileWriter::spawn(w))),
-        ),
+        Ok(w) => {
+            let (non_blocking, worker_guard) = tracing_appender::non_blocking(w);
+            guard = Some(worker_guard);
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(AsciiWriter(non_blocking)),
+            )
+        }
         Err(e) => {
             let message = format!(
                 "Log directory unavailable ({}): {e}. Using stdout only.",
@@ -89,61 +92,7 @@ pub fn init(cfg: &LogCfg) {
         .with(stdout)
         .with(files)
         .init();
-}
-
-/// Async file writer: moves disk writes and rotation to a background thread so Tokio workers are not blocked.
-#[derive(Clone)]
-struct AsyncFileWriter {
-    tx: Arc<SyncSender<Vec<u8>>>,
-}
-
-impl AsyncFileWriter {
-    fn spawn(file: RotatingFile) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(ASYNC_LOG_QUEUE);
-        let _ = thread::Builder::new()
-            .name("xiaozhi-log".into())
-            .spawn(move || {
-                while let Ok(buf) = rx.recv() {
-                    let _ = file.write_bytes(&buf);
-                }
-            });
-        Self { tx: Arc::new(tx) }
-    }
-}
-
-struct AsyncGuard {
-    tx: Arc<SyncSender<Vec<u8>>>,
-    buf: Vec<u8>,
-}
-
-impl<'a> MakeWriter<'a> for AsyncFileWriter {
-    type Writer = AsyncGuard;
-
-    fn make_writer(&'a self) -> AsyncGuard {
-        AsyncGuard {
-            tx: self.tx.clone(),
-            buf: Vec::with_capacity(256),
-        }
-    }
-}
-
-impl Write for AsyncGuard {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buf.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Drop for AsyncGuard {
-    fn drop(&mut self) {
-        if !self.buf.is_empty() {
-            let _ = self.tx.try_send(std::mem::take(&mut self.buf));
-        }
-    }
+    guard
 }
 
 /// Past max_bytes rotate current -> .1, .1 -> .2 ..., keeping only `keep` files
@@ -186,7 +135,10 @@ impl RotatingFile {
 
     fn open(&self, state: &mut FileState) -> io::Result<()> {
         if state.file.is_none() {
-            let file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?;
             state.size = file.metadata()?.len();
             state.file = Some(file);
         }
@@ -199,14 +151,35 @@ impl RotatingFile {
             let oldest = path_with_index(&self.path, self.keep - 1);
             let _ = fs::remove_file(oldest);
             for i in (1..self.keep - 1).rev() {
-                let _ = fs::rename(path_with_index(&self.path, i), path_with_index(&self.path, i + 1));
+                let _ = fs::rename(
+                    path_with_index(&self.path, i),
+                    path_with_index(&self.path, i + 1),
+                );
             }
             fs::rename(&self.path, path_with_index(&self.path, 1))?;
         }
-        let file = OpenOptions::new().create(true).write(true).truncate(true).open(&self.path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)?;
         state.size = 0;
         state.file = Some(file);
         Ok(())
+    }
+}
+
+impl Write for RotatingFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_bytes(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match state.file.as_mut() {
+            Some(file) => file.flush(),
+            None => Ok(()),
+        }
     }
 }
 
@@ -216,35 +189,10 @@ fn path_with_index(path: &Path, index: usize) -> PathBuf {
     PathBuf::from(name)
 }
 
-impl<'a> MakeWriter<'a> for RotatingFile {
-    type Writer = Guard<'a>;
-
-    fn make_writer(&'a self) -> Guard<'a> {
-        Guard { inner: self }
-    }
-}
-
-pub struct Guard<'a> {
-    inner: &'a RotatingFile,
-}
-
-impl Write for Guard<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.write_bytes(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        match state.file.as_mut() {
-            Some(file) => file.flush(),
-            None => Ok(()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn formatted_events_escape_non_ascii_payloads() {
