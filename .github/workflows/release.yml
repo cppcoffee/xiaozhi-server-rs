@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev pkg-config cmake
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package release archive
+        run: |
+          mkdir -p staging artifacts
+          cp target/${{ matrix.target }}/release/xiaozhi-server-rs config.example.toml staging/
+          tar -C staging -czf artifacts/xiaozhi-server-rs-${{ github.ref_name }}-${{ matrix.target }}.tar.gz xiaozhi-server-rs config.example.toml
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: artifacts/*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        working-directory: artifacts
+        run: |
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          for f in *.tar.gz; do
+            sha256sum "$f" > "$f.sha256"
+          done
+          {
+            echo "## SHA256 Checksums"
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } > ../release_body.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body_path: release_body.md
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
+            artifacts/SHA256SUMS.txt
