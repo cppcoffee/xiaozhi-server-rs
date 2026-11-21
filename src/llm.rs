@@ -176,6 +176,11 @@ async fn completion(
     while let Some(event) = events.next().await {
         let event = event.context("invalid LLM SSE event")?;
         if event.data.trim() == "[DONE]" {
+            // Drain the trailing chunked EOF briefly so hyper returns the TLS connection to the pool.
+            let _ = tokio::time::timeout(Duration::from_millis(20), async {
+                while events.next().await.is_some() {}
+            })
+            .await;
             break;
         }
         let prev_len = result.text.len();

@@ -239,6 +239,12 @@ async fn stream_v3_audio(
                 }
                 if done {
                     complete = true;
+                    // Drain the trailing HTTP chunked EOF briefly so hyper pools the TLS connection
+                    // instead of tearing it down between sentences.
+                    let _ = tokio::time::timeout(Duration::from_millis(20), async {
+                        while let Ok(Some(_)) = response.chunk().await {}
+                    })
+                    .await;
                     break 'response;
                 }
             }

@@ -39,6 +39,10 @@ const OUTPUT_FRAME_INTERVAL: Duration = Duration::from_millis(OUTPUT_FRAME_MS as
 /// 历史消息中过长的旧工具结果在后续轮次中省略，减少无谓 prefill 耗时
 const COMPACT_TOOL_HISTORY_BYTES: usize = 512;
 
+/// 服务端静音兜底时长：若设备本地端点漏检导致迟迟不发 listen stop，
+/// 说话后连续静音达到该阈值即主动结束本轮并触发识别，避免死等设备 15s 超时。
+const SERVER_SILENCE_FALLBACK_MS: u32 = 1200;
+
 // One absolute clock per accepted text turn; progress never renews these limits.
 pub(crate) const FIRST_AUDIO_BUDGET: Duration = Duration::from_secs(75);
 pub(crate) const FAILURE_RESERVE: Duration = Duration::from_secs(10);
@@ -305,6 +309,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
     let mut manual_mode = false;
     let mut listening = false;
     let mut speech_started = false;
+    let mut post_speech_silent_frames: u32 = 0;
     let mut input = None;
     let mut received_frames = 0;
     let mut peak_rms = 0_f64;
@@ -369,6 +374,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                                 received_frames = 0;
                                 peak_rms = 0.0;
                                 speech_started = false;
+                                post_speech_silent_frames = 0;
                                 listening = true;
                             }
                             "stop" if listening => {
@@ -382,6 +388,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                                 );
                                 listening = false;
                                 speech_started = false;
+                                post_speech_silent_frames = 0;
                                 if asr_tx.try_send(AsrCmd::Flush).is_err() {
                                     closed.cancel();
                                 }
@@ -393,6 +400,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                                     shared.abort_turn(input.take()).await;
                                     listening = false;
                                     speech_started = false;
+                                    post_speech_silent_frames = 0;
                                     let turn = CancellationToken::new();
                                     input = Some(turn.clone());
                                     if manual_tx
@@ -415,11 +423,13 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                         shared.abort_turn(input.take()).await;
                         listening = false;
                         speech_started = false;
+                        post_speech_silent_frames = 0;
                     }
                     "goodbye" => {
                         debug!("Device sent goodbye");
                         listening = false;
                         speech_started = false;
+                        post_speech_silent_frames = 0;
                     }
                     "ping" => {
                         shared.send_json(crate::protocol::pong()).await;
@@ -442,8 +452,11 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                 received_frames += 1;
                 let (event, level) = vad.push_with_rms(&pcm);
                 peak_rms = peak_rms.max(level);
+                let fallback_frames = (SERVER_SILENCE_FALLBACK_MS / crate::config::INPUT_FRAME_MS)
+                    .max(cfg.vad.end_frames.saturating_mul(2));
                 match event {
                     VadEvent::StartSpeech => {
+                        post_speech_silent_frames = 0;
                         if !speech_started {
                             info!("Speech detected");
                             speech_started = true;
@@ -459,6 +472,26 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                         }
                     }
                     VadEvent::None if speech_started || vad.is_speaking() => {
+                        if level >= cfg.vad.rms_threshold {
+                            post_speech_silent_frames = 0;
+                        } else {
+                            post_speech_silent_frames += 1;
+                        }
+                        if !manual_mode && post_speech_silent_frames >= fallback_frames {
+                            info!(
+                                "Ending input after {} ms of post-speech silence",
+                                post_speech_silent_frames * crate::config::INPUT_FRAME_MS
+                            );
+                            listening = false;
+                            speech_started = false;
+                            post_speech_silent_frames = 0;
+                            if asr_tx.try_send(AsrCmd::Pcm(pcm)).is_err()
+                                || asr_tx.try_send(AsrCmd::Flush).is_err()
+                            {
+                                closed.cancel();
+                            }
+                            continue;
+                        }
                         if asr_tx.try_send(AsrCmd::Pcm(pcm)).is_err() {
                             closed.cancel();
                         }
@@ -470,10 +503,25 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                         pre_roll.push_back(pcm);
                     }
                     VadEvent::EndSpeech(capped) => {
-                        // 设备本地端点（约 660 ms 静音）比服务端能量门限准，由它的
-                        // listen stop 收尾；但保持继续向云端 ASR 转发静音帧，避免句中吞字
-                        // 并让云端提前完成尾音解码，只在上限（20s）时强制截断。
+                        // 短停顿优先等设备本地端点发 listen stop，同时继续向 ASR 转发尾音；
+                        // 若超过服务端静音兜底（默认 1.2s）或 20s 录音上限，由服务端主动收尾。
                         if !capped {
+                            post_speech_silent_frames += 1;
+                            if !manual_mode && post_speech_silent_frames >= fallback_frames {
+                                info!(
+                                    "Ending input after {} ms of post-speech silence",
+                                    post_speech_silent_frames * crate::config::INPUT_FRAME_MS
+                                );
+                                listening = false;
+                                speech_started = false;
+                                post_speech_silent_frames = 0;
+                                if asr_tx.try_send(AsrCmd::Pcm(pcm)).is_err()
+                                    || asr_tx.try_send(AsrCmd::Flush).is_err()
+                                {
+                                    closed.cancel();
+                                }
+                                continue;
+                            }
                             debug!("Pause detected. Forwarding audio while waiting for the device to stop listening.");
                             if asr_tx.try_send(AsrCmd::Pcm(pcm)).is_err() {
                                 closed.cancel();
@@ -483,6 +531,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                         info!("Ending input at the recording duration limit");
                         listening = false;
                         speech_started = false;
+                        post_speech_silent_frames = 0;
                         if asr_tx.try_send(AsrCmd::Pcm(pcm)).is_err()
                             || asr_tx.try_send(AsrCmd::Flush).is_err()
                         {
@@ -636,24 +685,35 @@ async fn run_turn_inner(
         .await;
     shared.send_tts_state("start", None).await;
 
-    // 组织上下文（压缩历史中过大的旧工具 JSON，降低 prefill 延迟）
-    let mut messages: Vec<Value> = Vec::new();
-    if !shared.cfg.llm.prompt.trim().is_empty() {
-        messages.push(json!({"role": "system", "content": shared.cfg.llm.prompt}));
-    }
-    {
-        let hist = shared.history.lock().await;
-        messages.extend(hist.iter().map(compact_history_message));
-    }
-    messages.push(json!({"role": "user", "content": user_text}));
-
-    let model_started = Instant::now();
     let (sentence_tx, mut sentence_rx) = mpsc::channel::<String>(16);
     // 64 帧 ≈ 3.84 秒预取缓冲：播放第 N 句时并发预合成第 N+1 句，消除句间停顿
     let (pacer_tx, pacer_rx) = mpsc::channel::<PacerItem>(64);
 
-    let llm_fut = async move {
-        let out = chat_stream_sentences(
+    let question = user_text.as_str();
+    let reply_fut = async move {
+        if let Some(answer) = shared.mcp.direct_answer(question, token).await {
+            let mut buffer = answer.clone();
+            for sentence in crate::text::split_sentences(&mut buffer, true) {
+                sentence_tx
+                    .send(sentence)
+                    .await
+                    .context("TTS queue closed")?;
+            }
+            return Ok(vec![json!({"role":"assistant", "content":answer})]);
+        }
+
+        // 历史中较大的旧工具结果只保留提示，降低模型 prefill 延迟。
+        let mut messages = Vec::new();
+        if !shared.cfg.llm.prompt.trim().is_empty() {
+            messages.push(json!({"role": "system", "content": shared.cfg.llm.prompt}));
+        }
+        {
+            let hist = shared.history.lock().await;
+            messages.extend(hist.iter().map(compact_history_message));
+        }
+        messages.push(json!({"role": "user", "content": question}));
+        let model_started = Instant::now();
+        let (_, transcript) = chat_stream_sentences(
             &shared.cfg.llm,
             messages,
             shared.mcp.clone(),
@@ -665,7 +725,7 @@ async fn run_turn_inner(
             elapsed_ms = model_started.elapsed().as_millis(),
             "LLM and tools complete"
         );
-        Ok::<_, anyhow::Error>(out)
+        Ok::<_, anyhow::Error>(transcript)
     };
 
     let tts_fut = async move {
@@ -686,7 +746,7 @@ async fn run_turn_inner(
 
     let pacer_fut = run_audio_pacer(shared, pacer_rx, token, budget);
 
-    let ((_full_text, transcript), (), ()) = tokio::try_join!(llm_fut, tts_fut, pacer_fut)?;
+    let (transcript, (), ()) = tokio::try_join!(reply_fut, tts_fut, pacer_fut)?;
     let mut history = vec![json!({"role":"user", "content":user_text})];
     history.extend(transcript);
     Ok(history)

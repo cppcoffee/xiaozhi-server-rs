@@ -724,7 +724,7 @@ async fn real_websocket_reader_services_ping_abort_and_a_second_manual_turn() {
     let session_id = ws_handshake(&mut ws).await;
     ws_send(
         &mut ws,
-        json!({"type":"listen","state":"detect","mode":"manual","text":"现在几点？"}),
+        json!({"type":"listen","state":"detect","mode":"manual","text":"帮我查一下现在几点？"}),
     )
     .await;
     let pending = loop {
@@ -1164,6 +1164,111 @@ fn drain_states(output: &mut mpsc::Receiver<Message>) -> Vec<Value> {
         }
     }
     states
+}
+
+#[tokio::test]
+async fn direct_device_reading_removes_two_model_requests_before_first_audio() {
+    let mut rig = Rig::all().await;
+    let (server, fake) = llm_server(vec![
+        call_sse(&["get_current_time"], "time"),
+        answer_sse("现在是16点05分。"),
+    ])
+    .await;
+    *fake.llm_delays.lock().unwrap() = [Duration::from_millis(100); 2].into();
+    *fake.tts_delays.lock().unwrap() = [Duration::from_millis(60)].into();
+    fake.audio_frames
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let (shared, mut output) = turn_shared(&rig, &server);
+    let started = std::time::Instant::now();
+    let turn = tokio::spawn(async move {
+        let tts = crate::tts::DoubaoTts::new(shared.cfg.tts.clone());
+        crate::session::run_turn(&shared, &tts, "现在几点了？".into(), CancellationToken::new())
+            .await
+            .unwrap();
+        let history = shared.history.lock().await;
+        assert_eq!(history.last().unwrap()["content"], "现在是16点05分。");
+    });
+    let reading = rig.recv().await;
+    assert_eq!(reading["params"]["name"], "self.get_current_time");
+    rig.content(
+        &reading,
+        json!({"synchronized":true, "local_time":"2026-11-21T16:05:00+08:00"}),
+    );
+    let states = tokio::time::timeout(Duration::from_secs(2), turn_audio(&mut output))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed().as_millis();
+    let model_requests = fake.requests.lock().unwrap().len();
+    let tts_requests = fake.tts.lock().unwrap().len();
+    eprintln!("direct reading: first audio {elapsed} ms, LLM={model_requests}, TTS={tts_requests}");
+    assert!(states.iter().any(|state| state["text"] == "现在是16点05分"));
+    turn.await.unwrap();
+    assert_eq!(model_requests, 0);
+    assert_eq!(tts_requests, 1);
+    assert!(rig.outgoing.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn direct_device_reading_uses_validated_data_and_exact_questions() {
+    let mut rig = Rig::all().await;
+    let cases = [
+        (
+            "现在几点？",
+            "self.get_current_time",
+            json!({"synchronized":false}),
+            "设备时间尚未同步，无法确认当前时间。",
+        ),
+        (
+            "室内多少度？",
+            "self.get_sensor_reading",
+            json!({"available":true,"temperature_c":23.5,"humidity_percent":58}),
+            "室内温度是23.5摄氏度。",
+        ),
+        (
+            "室内湿度多少",
+            "self.get_sensor_reading",
+            json!({"available":true,"temperature_c":23.5,"humidity_percent":58}),
+            "室内湿度是百分之58.0。",
+        ),
+        (
+            "室内湿度多少",
+            "self.get_sensor_reading",
+            json!({"available":false}),
+            "设备没有可用的本地温湿度读数。",
+        ),
+        (
+            "室内湿度多少",
+            "self.get_sensor_reading",
+            json!({"available":true,"temperature_c":23.5,"humidity_percent":200}),
+            "设备数据读取失败，暂时无法提供可靠的实时信息。",
+        ),
+    ];
+    for (question, tool, data, expected) in cases {
+        let device = rig.device.clone();
+        let answer = tokio::spawn(async move {
+            device
+                .direct_answer(question, &CancellationToken::new())
+                .await
+        });
+        let request = rig.recv().await;
+        assert_eq!(request["params"]["name"], tool);
+        rig.content(&request, data);
+        assert_eq!(answer.await.unwrap().as_deref(), Some(expected));
+    }
+    for question in ["明天几点下雨？", "室内多少度，湿度呢？", "刚才呢？"] {
+        assert!(rig
+            .device
+            .direct_answer(question, &CancellationToken::new())
+            .await
+            .is_none());
+    }
+    assert!(rig.outgoing.try_recv().is_err());
+
+    let no_mcp = DeviceMcp::new("no-mcp".into(), mpsc::channel(1).0, CancellationToken::new());
+    assert!(no_mcp
+        .direct_answer("现在几点？", &CancellationToken::new())
+        .await
+        .is_none());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1882,6 +1987,85 @@ async fn mid_question_pause_waits_for_device_stop() {
             let msg: Value = serde_json::from_str(&text).unwrap();
             if msg["type"] == "stt" {
                 assert_eq!(msg["text"], "明天会下雨吗？");
+                stt = true;
+            } else if msg["type"] == "tts" && msg["state"] == "stop" {
+                assert!(stt, "stop before stt");
+                break;
+            }
+        }
+    }
+}
+
+/// If the device's local endpoint never fires, sustained post-speech silence (1.2 s)
+/// must still trigger ASR flush on the server instead of stalling until the 15 s cap.
+#[tokio::test]
+async fn sustained_post_speech_silence_flushes_without_device_stop() {
+    let (cloud, _fake) = llm_server(vec![answer_sse("不会下雨。")]).await;
+    let mut config = cfg(&cloud.url);
+    config.tts.api_url = format!("{}/tts", cloud.url);
+    config.vad.start_frames = 1;
+    config.vad.end_frames = 6;
+    let asr = serve(Router::new().route(
+        "/asr",
+        get(|upgrade: axum::extract::ws::WebSocketUpgrade| async move {
+            upgrade.on_upgrade(|mut socket| async move {
+                if !matches!(socket.recv().await, Some(Ok(Message::Binary(_)))) {
+                    return;
+                }
+                let response = |json: Value| {
+                    let body = json.to_string().into_bytes();
+                    let mut bytes = vec![0x11, 0x90, 0x10, 0, 0, 0, 0, 0];
+                    bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
+                    bytes.extend_from_slice(&body);
+                    Message::Binary(bytes.into())
+                };
+                socket.send(response(json!({"code": 0}))).await.unwrap();
+                while let Some(Ok(Message::Binary(bytes))) = socket.recv().await {
+                    if bytes[1] & 0x0f == 0x02 {
+                        socket
+                            .send(response(json!({
+                                "result": {"utterances": [{"definite": true, "text": "今天会下雨吗？"}]}
+                            })))
+                            .await
+                            .unwrap();
+                    }
+                }
+            })
+        }),
+    ))
+    .await;
+    config.asr.ws_url = asr.url.replace("http://", "ws://") + "/asr";
+    let device = serve(
+        Router::new()
+            .route("/ws", get(crate::session::ws_handler))
+            .with_state(Arc::new(ConfigStore::new("unused".into(), config))),
+    )
+    .await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(device.url.replace("http://", "ws://") + "/ws")
+        .await
+        .unwrap();
+    ws_handshake(&mut ws).await;
+
+    ws_send(&mut ws, json!({"type":"listen","state":"start","mode":"auto"})).await;
+    let mut enc = crate::audio::OpusOut::new(16_000, 60).unwrap();
+    let loud: Vec<i16> = (0..960 * 3)
+        .map(|i| ((i as f32 * 0.18).sin() * 9000.0) as i16)
+        .collect();
+    for packet in enc.encode(&loud) {
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(packet.into())).await.unwrap();
+    }
+    // 22 silent frames (1320 ms, allowing 1-2 frames of Opus decay) without `listen stop`.
+    for packet in enc.encode(&vec![0i16; 960 * 22]) {
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(packet.into())).await.unwrap();
+    }
+    let mut stt = false;
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await.unwrap().unwrap().unwrap();
+        if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+            let msg: Value = serde_json::from_str(&text).unwrap();
+            if msg["type"] == "stt" {
+                assert_eq!(msg["text"], "今天会下雨吗？");
                 stt = true;
             } else if msg["type"] == "tts" && msg["state"] == "stop" {
                 assert!(stt, "stop before stt");

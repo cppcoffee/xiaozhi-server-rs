@@ -211,6 +211,7 @@ pub struct DoubaoAsr {
     ws: Option<AsrSocket>,
     next_sequence: Option<i32>,
     pending_pcm: Vec<u8>,
+    has_pcm: bool,
     confirmed_text: Option<String>,
 }
 
@@ -222,6 +223,7 @@ impl DoubaoAsr {
             ws: None,
             next_sequence: None,
             pending_pcm: Vec::new(),
+            has_pcm: false,
             confirmed_text: None,
         }
     }
@@ -310,6 +312,9 @@ impl DoubaoAsr {
     }
 
     async fn send_pcm(&mut self, pcm: &[i16]) -> Result<()> {
+        if pcm.is_empty() {
+            return Ok(());
+        }
         if self.ws.is_none() {
             self.connect().await?;
         }
@@ -325,6 +330,7 @@ impl DoubaoAsr {
         } else {
             self.send_audio(&bytes.collect::<Vec<_>>(), false).await?;
         }
+        self.has_pcm = true;
         Ok(())
     }
 
@@ -347,6 +353,7 @@ impl DoubaoAsr {
     fn reset(&mut self) {
         self.ws = None;
         self.pending_pcm.clear();
+        self.has_pcm = false;
         self.confirmed_text = None;
         self.next_sequence = None;
     }
@@ -498,6 +505,7 @@ async fn read_result(asr: &mut DoubaoAsr, cmd: AsrCmd) -> Option<String> {
             }
             drain_pending(asr, 0).await
         }
+        AsrCmd::Flush if !asr.has_pcm => Ok(Some(String::new())),
         AsrCmd::Flush => {
             async {
                 let started = tokio::time::Instant::now();
@@ -546,6 +554,66 @@ pub async fn probe(cfg: &crate::config::AsrCfg, sample_rate: u32) -> Result<Stri
 mod tests {
     use super::*;
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+    #[tokio::test]
+    async fn empty_turn_finishes_without_an_asr_audio_packet() {
+        let mut packet_counts = Vec::new();
+        for modern in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                assert!(matches!(ws.next().await, Some(Ok(Message::Binary(_)))));
+                ws.send(Message::Binary(
+                    frame(9, false, Some(1), br#"{"code":20000000}"#)
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+                let packets = usize::from(matches!(ws.next().await, Some(Ok(Message::Binary(_)))));
+                if packets > 0 {
+                    let _ = ws
+                        .send(Message::Binary(
+                            frame(9, true, Some(2), br#"{"code":20000000,"result":{}}"#)
+                                .unwrap()
+                                .into(),
+                        ))
+                        .await;
+                }
+                packets
+            });
+
+            let mut cfg = crate::config::Config::parse(include_str!("../config.example.toml"))
+                .unwrap()
+                .asr;
+            cfg.appid = "test-app".into();
+            cfg.access_token = "test-token".into();
+            cfg.speech_api_key = modern.then(|| "test-voice-key".into());
+            cfg.ws_url = format!("ws://{address}");
+            let (tx, rx) = mpsc::channel(8);
+            let (out, mut results) = mpsc::channel(1);
+            let cancel = CancellationToken::new();
+            let worker = tokio::spawn(run_asr(cfg, 16_000, rx, out, cancel.clone()));
+            tx.send(AsrCmd::Start(CancellationToken::new()))
+                .await
+                .unwrap();
+            tx.send(AsrCmd::Flush).await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_secs(2), results.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .text
+                .is_empty());
+            let packets = server.await.unwrap();
+            eprintln!("ASR modern={modern} empty audio packets={packets}");
+            cancel.cancel();
+            worker.await.unwrap();
+            packet_counts.push(packets);
+        }
+        assert_eq!(packet_counts, [0, 0]);
+    }
 
     #[tokio::test]
     async fn project_key_sends_pcm_and_waits_for_full_final_transcript() {
