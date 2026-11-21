@@ -38,22 +38,28 @@ pub struct ToolTurn {
 
 impl ToolTurn {
     pub fn new(messages: &mut Vec<Value>) -> Self {
-        messages.insert(
-            messages.len().saturating_sub(1),
-            json!({"role":"system", "content":TOOL_POLICY}),
+        // Keep TOOL_POLICY right after any leading system prompt so the prefix
+        // remains stable across turns for provider KV prompt caching.
+        let pos = usize::from(
+            messages
+                .first()
+                .is_some_and(|m| m["role"].as_str() == Some("system")),
         );
+        messages.insert(pos, json!({"role":"system", "content":TOOL_POLICY}));
         Self::default()
     }
 
-    pub async fn call(
-        &mut self,
-        device: &DeviceMcp,
-        alias: &str,
-        arguments: &str,
-        cancel: &CancellationToken,
-    ) -> String {
+    pub fn has_unavailable(&self) -> bool {
+        !self.unavailable.is_empty()
+    }
+
+    pub fn cache_warning(&self) -> Option<&'static str> {
+        self.cache_warning
+    }
+
+    pub fn record_result(&mut self, alias: &str, outcome: Result<Value>) -> String {
         let reading = is_reading(alias);
-        let result = match device.call(alias, arguments, cancel).await {
+        let result = match outcome {
             Err(e) if !reading => {
                 self.unavailable
                     .insert("这个操作没有执行成功，暂时无法完成请求。");
@@ -91,6 +97,18 @@ impl ToolTurn {
             }
         };
         result.to_string()
+    }
+
+    #[allow(dead_code)]
+    pub async fn call(
+        &mut self,
+        device: &DeviceMcp,
+        alias: &str,
+        arguments: &str,
+        cancel: &CancellationToken,
+    ) -> String {
+        let outcome = device.call(alias, arguments, cancel).await;
+        self.record_result(alias, outcome)
     }
 
     pub fn answer(self, text: String) -> String {

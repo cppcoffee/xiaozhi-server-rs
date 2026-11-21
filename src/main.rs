@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use axum::routing::{get, post};
+use axum::serve::ListenerExt;
 use axum::Router;
 use tracing::{info, warn};
 
@@ -68,9 +69,17 @@ async fn main() -> anyhow::Result<()> {
     let http_addr = SocketAddr::from(([0, 0, 0, 0], cfg.server.http_port));
 
     let http_listener = tokio::net::TcpListener::bind(http_addr)
-        .await.with_context(|| format!("无法监听 HTTP(OTA) {http_addr}"))?;
+        .await
+        .with_context(|| format!("无法监听 HTTP(OTA) {http_addr}"))?
+        .tap_io(|stream| {
+            let _ = stream.set_nodelay(true);
+        });
     let ws_listener = tokio::net::TcpListener::bind(ws_addr)
-        .await.with_context(|| format!("无法监听 WebSocket {ws_addr}"))?;
+        .await
+        .with_context(|| format!("无法监听 WebSocket {ws_addr}"))?
+        .tap_io(|stream| {
+            let _ = stream.set_nodelay(true);
+        });
 
     info!("HTTP(OTA) 监听 {http_addr}");
     info!("WebSocket 监听 {ws_addr}  路径 /xiaozhi/v1/");

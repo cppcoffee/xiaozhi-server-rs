@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -17,11 +17,11 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::asr::{run_asr, AsrCmd, AsrOutcome};
-use crate::audio::{bytes_to_i16, OpusIn, OpusOut};
+use crate::audio::{OpusIn, OpusOut};
 use crate::config::Config;
-use crate::llm::chat_stream;
+use crate::llm::chat_stream_sentences;
 use crate::mcp::DeviceMcp;
-use crate::text::{clean_for_tts, split_sentences};
+use crate::text::clean_for_tts;
 use crate::tts::DoubaoTts;
 use crate::vad::{EnergyVad, VadEvent};
 
@@ -30,6 +30,14 @@ const HISTORY_ROUNDS: usize = 6;
 
 /// 多久没有任何消息就断开这条连接（设备待机时只有唤醒才发消息）
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 播放起步预缓冲帧数：首 2 帧（120ms）免休眠连发，给 ESP32 建立抖动缓冲
+const PRE_BUFFER_FRAMES: usize = 2;
+const OUTPUT_FRAME_MS: u32 = 60;
+const OUTPUT_FRAME_INTERVAL: Duration = Duration::from_millis(OUTPUT_FRAME_MS as u64);
+
+/// 历史消息中过长的旧工具结果在后续轮次中省略，减少无谓 prefill 耗时
+const COMPACT_TOOL_HISTORY_BYTES: usize = 512;
 
 // One absolute clock per accepted text turn; progress never renews these limits.
 pub(crate) const FIRST_AUDIO_BUDGET: Duration = Duration::from_secs(75);
@@ -162,7 +170,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
 
     let (sink, mut stream) = sock.split();
     let (ws_tx, ws_rx) = mpsc::channel::<Message>(512);
-    let (audio_tx, mut audio_rx) = mpsc::channel::<AudioFrame>(2);
+    let (audio_tx, mut audio_rx) = mpsc::channel::<AudioFrame>(8);
 
     let closed = CancellationToken::new();
     let _connection_guard = closed.clone().drop_guard();
@@ -175,28 +183,22 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
         loop {
             // Controls retain priority. Speech awaits each write receipt, so stop
             // cannot overtake its audio and stale queued frames can be discarded.
-            let (msg, receipt, audio_cancel) = tokio::select! {
+            let (msg, receipt) = tokio::select! {
                 biased;
                 _ = writer_closed.cancelled() => break,
-                msg = ws_rx.recv() => match msg { Some(msg) => (msg, None, None), None => break },
+                msg = ws_rx.recv() => match msg { Some(msg) => (msg, None), None => break },
                 frame = audio_rx.recv() => match frame {
-                    Some(frame) if !frame.cancel.is_cancelled() => (Message::Binary(frame.data.into()), Some(frame.sent), Some(frame.cancel)),
+                    Some(frame) if !frame.cancel.is_cancelled() => (Message::Binary(frame.data.into()), Some(frame.sent)),
                     Some(_) => continue,
                     None => break,
                 },
             };
+            let closing = matches!(&msg, Message::Close(_));
+            // Let an already-started small WS frame finish instead of tearing down
+            // the entire WebSocket on barge-in/abort; cancelled queued frames are dropped above.
             let sent = tokio::select! {
                 biased;
                 _ = writer_closed.cancelled() => break,
-                _ = async {
-                    if let Some(cancel) = &audio_cancel { cancel.cancelled().await; }
-                    else { std::future::pending::<()>().await; }
-                } => {
-                    // SinkExt::send may have partially written a frame. Do not
-                    // reuse that socket or finish sending cancelled audio later.
-                    warn!("in-flight audio write cancelled, closing WS");
-                    break;
-                },
                 result = tokio::time::timeout(Duration::from_secs(5), sink.send(msg)) => {
                     match result {
                         Ok(result) => result,
@@ -209,6 +211,9 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
             }
             if let Some(receipt) = receipt {
                 let _ = receipt.send(());
+            }
+            if closing {
+                break;
             }
         }
         writer_closed.cancel();
@@ -230,6 +235,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
     }
 
     let mcp = DeviceMcp::new(session_id.clone(), ws_tx.clone(), closed.clone());
+    let negotiated_sample_rate = Arc::new(AtomicU32::new(24_000));
     let shared = Arc::new(Shared {
         mcp,
         closed: closed.clone(),
@@ -246,6 +252,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
     let brain = {
         let shared = shared.clone();
         let tts = DoubaoTts::new(cfg.tts.clone());
+        let negotiated_sr = negotiated_sample_rate.clone();
         tokio::spawn(async move {
             loop {
                 let outcome = tokio::select! {
@@ -276,7 +283,8 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                     }
                     break;
                 }
-                if let Err(e) = run_turn(&shared, &tts, text, turn).await {
+                let output_sr = tts.preferred_sample_rate(negotiated_sr.load(Ordering::Relaxed));
+                if let Err(e) = run_turn_with_rate(&shared, &tts, text, turn, output_sr).await {
                     error!("回合处理失败: {e}");
                 }
             }
@@ -296,7 +304,10 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
     let mut pre_roll = VecDeque::with_capacity(PRE_ROLL_FRAMES);
     let mut manual_mode = false;
     let mut listening = false;
+    let mut speech_started = false;
     let mut input = None;
+    let mut received_frames = 0;
+    let mut peak_rms = 0_f64;
 
     loop {
         let msg = tokio::select! {
@@ -307,6 +318,10 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                     continue; // 正在回话，不算空闲
                 }
                 info!("空闲 {}s，关闭连接回收资源", IDLE_TIMEOUT.as_secs());
+                // Give the writer a chance to send Close before cancelling it.
+                if shared.ws_tx.try_send(Message::Close(None)).is_ok() {
+                    let _ = tokio::time::timeout(Duration::from_secs(1), closed.cancelled()).await;
+                }
                 break;
             }
         };
@@ -327,6 +342,9 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                 debug!("<- {t}");
                 match v["type"].as_str().unwrap_or("") {
                     "hello" => {
+                        if let Some(sr) = v["audio_params"]["sample_rate"].as_u64() {
+                            negotiated_sample_rate.store(sr as u32, Ordering::Relaxed);
+                        }
                         let welcome = cfg.welcome(&session_id, &v);
                         shared.send_json(welcome).await;
                         if v["features"]["mcp"] == true {
@@ -348,10 +366,22 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                                 input = Some(turn);
                                 vad = EnergyVad::new(&cfg.vad, crate::config::INPUT_FRAME_MS);
                                 pre_roll.clear();
+                                received_frames = 0;
+                                peak_rms = 0.0;
+                                speech_started = false;
                                 listening = true;
                             }
                             "stop" if listening => {
+                                debug!(
+                                    target: "xiaozhi_input",
+                                    device_id,
+                                    received_frames,
+                                    peak_rms,
+                                    threshold = cfg.vad.rms_threshold,
+                                    "listen input"
+                                );
                                 listening = false;
+                                speech_started = false;
                                 if asr_tx.try_send(AsrCmd::Flush).is_err() {
                                     closed.cancel();
                                 }
@@ -362,6 +392,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                                 {
                                     shared.abort_turn(input.take()).await;
                                     listening = false;
+                                    speech_started = false;
                                     let turn = CancellationToken::new();
                                     input = Some(turn.clone());
                                     if manual_tx
@@ -383,6 +414,12 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                         info!("收到 abort，打断当前回合");
                         shared.abort_turn(input.take()).await;
                         listening = false;
+                        speech_started = false;
+                    }
+                    "goodbye" => {
+                        debug!("设备发送 goodbye");
+                        listening = false;
+                        speech_started = false;
                     }
                     "ping" => {
                         shared.send_json(crate::protocol::pong()).await;
@@ -402,18 +439,26 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                         continue;
                     }
                 };
-                match vad.push(&pcm) {
+                received_frames += 1;
+                let (event, level) = vad.push_with_rms(&pcm);
+                peak_rms = peak_rms.max(level);
+                match event {
                     VadEvent::StartSpeech => {
-                        info!("检测到说话开始");
-                        if pre_roll
-                            .drain(..)
-                            .chain(std::iter::once(pcm))
-                            .any(|frame| asr_tx.try_send(AsrCmd::Pcm(frame)).is_err())
-                        {
+                        if !speech_started {
+                            info!("检测到说话开始");
+                            speech_started = true;
+                            if pre_roll
+                                .drain(..)
+                                .chain(std::iter::once(pcm))
+                                .any(|frame| asr_tx.try_send(AsrCmd::Pcm(frame)).is_err())
+                            {
+                                closed.cancel();
+                            }
+                        } else if asr_tx.try_send(AsrCmd::Pcm(pcm)).is_err() {
                             closed.cancel();
                         }
                     }
-                    VadEvent::None if vad.is_speaking() => {
+                    VadEvent::None if speech_started || vad.is_speaking() => {
                         if asr_tx.try_send(AsrCmd::Pcm(pcm)).is_err() {
                             closed.cancel();
                         }
@@ -426,13 +471,18 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                     }
                     VadEvent::EndSpeech(capped) => {
                         // 设备本地端点（约 660 ms 静音）比服务端能量门限准，由它的
-                        // listen stop 收尾；这里只在上限（一直有声音）时强制截断。
+                        // listen stop 收尾；但保持继续向云端 ASR 转发静音帧，避免句中吞字
+                        // 并让云端提前完成尾音解码，只在上限（20s）时强制截断。
                         if !capped {
-                            info!("检测到停顿，等待设备结束录音");
+                            debug!("检测到停顿，继续转发音频并等待设备结束录音");
+                            if asr_tx.try_send(AsrCmd::Pcm(pcm)).is_err() {
+                                closed.cancel();
+                            }
                             continue;
                         }
                         info!("输入达到录音上限，强制结束");
                         listening = false;
+                        speech_started = false;
                         if asr_tx.try_send(AsrCmd::Pcm(pcm)).is_err()
                             || asr_tx.try_send(AsrCmd::Flush).is_err()
                         {
@@ -454,11 +504,28 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
     let _ = brain.await;
 }
 
+enum PacerItem {
+    SentenceStart(String),
+    Audio(Vec<u8>),
+}
+
+#[allow(dead_code)]
 pub(crate) async fn run_turn(
     shared: &Arc<Shared>,
     tts: &DoubaoTts,
     user_text: String,
     token: CancellationToken,
+) -> Result<()> {
+    let output_sr = tts.preferred_sample_rate(24_000);
+    run_turn_with_rate(shared, tts, user_text, token, output_sr).await
+}
+
+pub(crate) async fn run_turn_with_rate(
+    shared: &Arc<Shared>,
+    tts: &DoubaoTts,
+    user_text: String,
+    token: CancellationToken,
+    output_sample_rate: u32,
 ) -> Result<()> {
     let user_text = user_text.trim().to_string();
     if user_text.is_empty() {
@@ -485,7 +552,7 @@ pub(crate) async fn run_turn(
             timed_out = true;
             Err(anyhow::anyhow!("turn deadline exceeded"))
         },
-        result = run_turn_inner(shared, tts, user_text, &normal_cancel, &budget) => result.map(Some),
+        result = run_turn_inner(shared, tts, user_text, &normal_cancel, &budget, output_sample_rate) => result.map(Some),
     };
     // Dropping the inner future aborts HTTP and rmcp's request guard cancels RPCs.
     // Keep recovery on the parent token so abort/disconnect still interrupts it.
@@ -501,13 +568,14 @@ pub(crate) async fn run_turn(
             shared.send_tts_state("sentence_start", Some(text)).await;
             let deadline = budget.recovery_deadline();
             if Instant::now() < deadline {
-                if let Ok(mut encoder) = OpusOut::new(24_000, 60) {
-                    tokio::select! {
-                        biased;
-                        _ = token.cancelled() => {},
-                        _ = shared.closed.cancelled() => {},
-                        _ = tokio::time::timeout_at(deadline, speak_audio(shared, tts, &mut encoder, text, &token, &budget)) => {},
-                    }
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => {},
+                    _ = shared.closed.cancelled() => {},
+                    _ = tokio::time::timeout_at(
+                        deadline,
+                        speak_single_sentence(shared, tts, text, &token, &budget, output_sample_rate),
+                    ) => {},
                 }
             }
         }
@@ -539,12 +607,28 @@ fn trim_history(hist: &mut Vec<Value>) {
     }
 }
 
+fn compact_history_message(msg: &Value) -> Value {
+    if msg["role"].as_str() == Some("tool") {
+        if let Some(content) = msg["content"].as_str() {
+            if content.len() > COMPACT_TOOL_HISTORY_BYTES {
+                let mut compact = msg.clone();
+                compact["content"] = json!(
+                    "{\"note\":\"prior turn tool output omitted; call tool again for current readings\"}"
+                );
+                return compact;
+            }
+        }
+    }
+    msg.clone()
+}
+
 async fn run_turn_inner(
     shared: &Arc<Shared>,
     tts: &DoubaoTts,
     user_text: String,
     token: &CancellationToken,
     budget: &TurnBudget,
+    output_sample_rate: u32,
 ) -> Result<Vec<Value>> {
     info!("[{}] 用户: {user_text}", shared.device_id);
     shared
@@ -552,82 +636,187 @@ async fn run_turn_inner(
         .await;
     shared.send_tts_state("start", None).await;
 
-    // 组织上下文
+    // 组织上下文（压缩历史中过大的旧工具 JSON，降低 prefill 延迟）
     let mut messages: Vec<Value> = Vec::new();
     if !shared.cfg.llm.prompt.trim().is_empty() {
         messages.push(json!({"role": "system", "content": shared.cfg.llm.prompt}));
     }
     {
         let hist = shared.history.lock().await;
-        messages.extend(hist.iter().cloned());
+        messages.extend(hist.iter().map(compact_history_message));
     }
     messages.push(json!({"role": "user", "content": user_text}));
 
     let model_started = Instant::now();
-    let (mut buf, transcript) = chat_stream(
-        &shared.cfg.llm,
-        messages,
-        shared.mcp.clone(),
-        token.clone(),
-    )
-    .await?;
-    debug!(elapsed_ms = model_started.elapsed().as_millis(), "LLM and tools complete");
-    let mut encoder = OpusOut::new(24_000, 60)?;
-    for sentence in split_sentences(&mut buf, true) {
-        speak(shared, tts, &mut encoder, &sentence, token, budget).await?;
-    }
+    let (sentence_tx, mut sentence_rx) = mpsc::channel::<String>(16);
+    // 64 帧 ≈ 3.84 秒预取缓冲：播放第 N 句时并发预合成第 N+1 句，消除句间停顿
+    let (pacer_tx, pacer_rx) = mpsc::channel::<PacerItem>(64);
+
+    let llm_fut = async move {
+        let out = chat_stream_sentences(
+            &shared.cfg.llm,
+            messages,
+            shared.mcp.clone(),
+            token.clone(),
+            Some(sentence_tx),
+        )
+        .await?;
+        debug!(
+            elapsed_ms = model_started.elapsed().as_millis(),
+            "LLM and tools complete"
+        );
+        Ok::<_, anyhow::Error>(out)
+    };
+
+    let tts_fut = async move {
+        let mut encoder = OpusOut::new(output_sample_rate, OUTPUT_FRAME_MS)?;
+        while let Some(raw) = sentence_rx.recv().await {
+            if token.is_cancelled() {
+                bail!("turn cancelled");
+            }
+            let text = clean_for_tts(&raw);
+            if text.is_empty() {
+                continue;
+            }
+            synthesize_sentence_to_pacer(tts, &mut encoder, &text, output_sample_rate, &pacer_tx, true)
+                .await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+
+    let pacer_fut = run_audio_pacer(shared, pacer_rx, token, budget);
+
+    let ((_full_text, transcript), (), ()) = tokio::try_join!(llm_fut, tts_fut, pacer_fut)?;
     let mut history = vec![json!({"role":"user", "content":user_text})];
     history.extend(transcript);
     Ok(history)
 }
 
-/// Text/status notifications never satisfy the first-audio deadline.
-async fn speak(
-    shared: &Arc<Shared>,
-    tts: &DoubaoTts,
-    encoder: &mut OpusOut,
-    sentence: &str,
-    token: &CancellationToken,
-    budget: &TurnBudget,
-) -> Result<()> {
-    let text = clean_for_tts(sentence);
-    if text.is_empty() {
-        return Ok(());
-    }
-    shared.send_tts_state("sentence_start", Some(&text)).await;
-    speak_audio(shared, tts, encoder, &text, token, budget).await
-}
-
-async fn speak_audio(
-    shared: &Arc<Shared>,
+async fn synthesize_sentence_to_pacer(
     tts: &DoubaoTts,
     encoder: &mut OpusOut,
     text: &str,
+    sample_rate: u32,
+    pacer_tx: &mpsc::Sender<PacerItem>,
+    emit_sentence_start: bool,
+) -> Result<()> {
+    let synth_started = Instant::now();
+    let (pcm_tx, mut pcm_rx) = mpsc::channel::<Vec<u8>>(16);
+    let synth = tts.synth_stream(text, sample_rate, pcm_tx);
+    let encode = async {
+        let mut emitted_start = !emit_sentence_start;
+        let mut produced_frames = 0usize;
+        while let Some(pcm_chunk) = pcm_rx.recv().await {
+            for frame in encoder.push_pcm_bytes(&pcm_chunk) {
+                if !emitted_start {
+                    emitted_start = true;
+                    pacer_tx
+                        .send(PacerItem::SentenceStart(text.to_owned()))
+                        .await
+                        .map_err(|_| anyhow!("audio pacer closed"))?;
+                }
+                produced_frames += 1;
+                pacer_tx
+                    .send(PacerItem::Audio(frame))
+                    .await
+                    .map_err(|_| anyhow!("audio pacer closed"))?;
+            }
+        }
+        if let Some(tail) = encoder.finish_stream() {
+            if !emitted_start {
+                pacer_tx
+                    .send(PacerItem::SentenceStart(text.to_owned()))
+                    .await
+                    .map_err(|_| anyhow!("audio pacer closed"))?;
+            }
+            produced_frames += 1;
+            pacer_tx
+                .send(PacerItem::Audio(tail))
+                .await
+                .map_err(|_| anyhow!("audio pacer closed"))?;
+        }
+        Ok::<_, anyhow::Error>(produced_frames)
+    };
+    let ((), produced_frames) = tokio::try_join!(synth, encode)?;
+    debug!(
+        elapsed_ms = synth_started.elapsed().as_millis(),
+        frames = produced_frames,
+        "TTS sentence synthesized"
+    );
+    ensure!(produced_frames > 0, "TTS produced no Opus frames");
+    Ok(())
+}
+
+/// 独立单调时钟流控器：前 2 帧免休眠预缓冲，后续 60ms 稳态发送，队列空停顿后自动重锚定防突发行。
+async fn run_audio_pacer(
+    shared: &Arc<Shared>,
+    mut pacer_rx: mpsc::Receiver<PacerItem>,
     token: &CancellationToken,
     budget: &TurnBudget,
 ) -> Result<()> {
-    let synth_started = Instant::now();
-    let pcm_bytes = tts.synth(text).await?;
-    debug!(elapsed_ms = synth_started.elapsed().as_millis(), "TTS sentence synthesized");
-    ensure!(!pcm_bytes.is_empty(), "TTS returned no audio");
-    let pcm = bytes_to_i16(&pcm_bytes);
-    let frames = encoder.encode_padded(&pcm);
-    ensure!(!frames.is_empty(), "TTS produced no Opus frames");
-    let mut next = Instant::now();
-    for frame in frames {
+    let mut sent_frames: usize = 0;
+    let mut next_deadline: Option<Instant> = None;
+    while let Some(item) = pacer_rx.recv().await {
         if token.is_cancelled() {
             bail!("turn cancelled");
         }
-        shared.send_audio(frame, token).await?;
-        if !budget.first_audio.swap(true, Ordering::SeqCst) {
-            debug!(
-                elapsed_ms = budget.started.elapsed().as_millis(),
-                "text turn to first audio"
-            );
+        match item {
+            PacerItem::SentenceStart(text) => {
+                shared.send_tts_state("sentence_start", Some(&text)).await;
+            }
+            PacerItem::Audio(frame) => {
+                if sent_frames >= PRE_BUFFER_FRAMES {
+                    let now = Instant::now();
+                    let deadline = match next_deadline {
+                        Some(d) if now <= d + OUTPUT_FRAME_INTERVAL => d,
+                        _ => now,
+                    };
+                    if deadline > now {
+                        tokio::time::sleep_until(deadline).await;
+                    }
+                    next_deadline = Some(deadline + OUTPUT_FRAME_INTERVAL);
+                }
+                shared.send_audio(frame, token).await?;
+                sent_frames += 1;
+                if sent_frames == PRE_BUFFER_FRAMES {
+                    next_deadline = Some(Instant::now() + OUTPUT_FRAME_INTERVAL);
+                }
+                if !budget.first_audio.swap(true, Ordering::SeqCst) {
+                    debug!(
+                        elapsed_ms = budget.started.elapsed().as_millis(),
+                        "text turn to first audio"
+                    );
+                }
+            }
         }
-        next += Duration::from_millis(60);
-        tokio::time::sleep_until(next).await;
     }
+    if sent_frames > 0 {
+        if token.is_cancelled() {
+            bail!("turn cancelled");
+        }
+        // One frame tail margin before tts:stop so the device drains buffered frames cleanly.
+        tokio::time::sleep(OUTPUT_FRAME_INTERVAL).await;
+    }
+    Ok(())
+}
+
+/// 失败/超时兜底单句播放（复用相同的流式编码与流控路径）
+async fn speak_single_sentence(
+    shared: &Arc<Shared>,
+    tts: &DoubaoTts,
+    text: &str,
+    token: &CancellationToken,
+    budget: &TurnBudget,
+    output_sample_rate: u32,
+) -> Result<()> {
+    let (pacer_tx, pacer_rx) = mpsc::channel::<PacerItem>(32);
+    let synth_fut = async move {
+        let mut encoder = OpusOut::new(output_sample_rate, OUTPUT_FRAME_MS)?;
+        synthesize_sentence_to_pacer(tts, &mut encoder, text, output_sample_rate, &pacer_tx, false)
+            .await
+    };
+    let pacer_fut = run_audio_pacer(shared, pacer_rx, token, budget);
+    let ((), ()) = tokio::try_join!(synth_fut, pacer_fut)?;
     Ok(())
 }
 

@@ -1,19 +1,46 @@
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{bail, ensure, Context, Result};
 use eventsource_stream::Eventsource;
-use futures_util::StreamExt;
+use futures_util::{future::join_all, StreamExt};
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::LlmCfg;
 use crate::mcp::{DeviceMcp, ToolTurn};
+use crate::text::split_sentences_streaming;
 
 pub const MAX_TOOL_ROUNDS: usize = 4;
 const MAX_CALLS: usize = 3;
 const MAX_TEXT: usize = 64 * 1024;
+
+fn shared_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_nodelay(true)
+            .build()
+            .expect("build LLM HTTP client")
+    })
+}
+
+fn apply_low_latency_params(base_url: &str, body: &mut Value) {
+    let url = base_url.to_ascii_lowercase();
+    if url.contains("volces.com")
+        || url.contains("deepseek.com")
+        || url.contains("bigmodel.cn")
+        || url.contains("moonshot.cn")
+    {
+        body["thinking"] = json!({"type": "disabled"});
+    } else if url.contains("dashscope.aliyuncs.com") {
+        body["enable_thinking"] = json!(false);
+    }
+}
 
 #[derive(Default)]
 struct ToolCall {
@@ -44,11 +71,6 @@ impl Completion {
             "unexpected LLM choice index"
         );
         let delta = &choice["delta"];
-        if let Some(text) = delta["content"].as_str() {
-            ensure!(self.finish.is_none(), "content after finish_reason");
-            self.text.push_str(text);
-            ensure!(self.text.len() <= MAX_TEXT, "LLM text too long");
-        }
         ensure!(
             delta.get("function_call").is_none_or(Value::is_null),
             "legacy function_call is not supported"
@@ -76,6 +98,11 @@ impl Completion {
                     "tool call too large"
                 );
             }
+        }
+        if let Some(text) = delta["content"].as_str() {
+            ensure!(self.finish.is_none(), "content after finish_reason");
+            self.text.push_str(text);
+            ensure!(self.text.len() <= MAX_TEXT, "LLM text too long");
         }
         if let Some(reason) = choice["finish_reason"].as_str() {
             ensure!(self.finish.is_none(), "duplicate finish_reason");
@@ -114,12 +141,15 @@ async fn completion(
     tools: &[Value],
     final_round: bool,
     ids: &mut HashSet<String>,
+    stream_tx: Option<&mpsc::Sender<String>>,
+    mut pre_emit: Option<&'static str>,
 ) -> Result<Completion> {
     let mut body = json!({"model":cfg.model, "messages":messages, "stream":true, "temperature":0.7, "max_tokens":1000});
+    apply_low_latency_params(&cfg.base_url, &mut body);
     if !tools.is_empty() {
         body["tools"] = json!(tools);
         body["tool_choice"] = json!(if final_round { "none" } else { "auto" });
-        body["parallel_tool_calls"] = json!(false);
+        body["parallel_tool_calls"] = json!(true);
     }
     let resp = client
         .post(format!(
@@ -141,49 +171,117 @@ async fn completion(
     });
     let mut events = Box::pin(stream.eventsource());
     let mut result = Completion::default();
+    let mut stream_buf = String::new();
+    let mut is_first_sentence = true;
     while let Some(event) = events.next().await {
         let event = event.context("invalid LLM SSE event")?;
         if event.data.trim() == "[DONE]" {
             break;
         }
+        let prev_len = result.text.len();
         result.push(serde_json::from_str(&event.data).context("invalid LLM stream JSON")?)?;
+        if let Some(tx) = stream_tx {
+            if result.calls.is_empty() && result.text.len() > prev_len {
+                stream_buf.push_str(&result.text[prev_len..]);
+                for sentence in
+                    split_sentences_streaming(&mut stream_buf, &mut is_first_sentence, false)
+                {
+                    if let Some(warning) = pre_emit.take() {
+                        let _ = tx.send(warning.to_owned()).await;
+                    }
+                    if tx.send(sentence).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
     }
     result.validate(ids)?;
+    if let Some(tx) = stream_tx {
+        if result.calls.is_empty() {
+            for sentence in split_sentences_streaming(&mut stream_buf, &mut is_first_sentence, true)
+            {
+                if let Some(warning) = pre_emit.take() {
+                    let _ = tx.send(warning.to_owned()).await;
+                }
+                let _ = tx.send(sentence).await;
+            }
+        }
+    }
     Ok(result)
 }
 
-/// OpenAI-compatible streaming tool loop. Only completed, tool-free text is spoken:
-/// a provider may emit speculative prose before its tool_calls delta arrives.
+/// OpenAI-compatible streaming tool loop.
 /// Returns final speech text and the complete assistant/tool history together.
+#[allow(dead_code)]
 pub async fn chat_stream(
+    cfg: &LlmCfg,
+    messages: Vec<Value>,
+    device: Arc<DeviceMcp>,
+    cancel: CancellationToken,
+) -> Result<(String, Vec<Value>)> {
+    chat_stream_sentences(cfg, messages, device, cancel, None).await
+}
+
+/// 流式对话与工具循环：在确认无不可用读数且非工具调用增量时，边生成边向 `sentence_tx` 吐句。
+pub async fn chat_stream_sentences(
     cfg: &LlmCfg,
     mut messages: Vec<Value>,
     device: Arc<DeviceMcp>,
     cancel: CancellationToken,
+    sentence_tx: Option<mpsc::Sender<String>>,
 ) -> Result<(String, Vec<Value>)> {
     let mut turn = ToolTurn::new(&mut messages);
     let initial_len = messages.len();
     let run = async {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()?;
+        let client = shared_http_client();
         let tools = device.llm_tools(&cancel).await;
         let mut ids = HashSet::new();
         for round in 0..=MAX_TOOL_ROUNDS {
+            let can_stream = !turn.has_unavailable();
+            let live_tx = if can_stream {
+                sentence_tx.as_ref()
+            } else {
+                None
+            };
             let response = completion(
-                &client, cfg, &messages, &tools, round == MAX_TOOL_ROUNDS, &mut ids,
-            ).await?;
+                client,
+                cfg,
+                &messages,
+                &tools,
+                round == MAX_TOOL_ROUNDS,
+                &mut ids,
+                live_tx,
+                if can_stream { turn.cache_warning() } else { None },
+            )
+            .await?;
             if response.calls.is_empty() {
                 ensure!(!response.text.trim().is_empty(), "LLM returned no answer");
                 let text = turn.answer(response.text);
+                if !can_stream {
+                    if let Some(tx) = &sentence_tx {
+                        let mut buf = text.clone();
+                        let mut is_first = true;
+                        for sentence in split_sentences_streaming(&mut buf, &mut is_first, true) {
+                            let _ = tx.send(sentence).await;
+                        }
+                    }
+                }
                 messages.push(json!({"role":"assistant", "content":text}));
                 return Ok((text, messages.split_off(initial_len)));
             }
             ensure!(round < MAX_TOOL_ROUNDS, "LLM tool round limit exceeded");
             messages.push(json!({"role":"assistant", "content":null,
                 "tool_calls":response.calls.values().map(ToolCall::message).collect::<Vec<_>>() }));
-            for call in response.calls.values() {
-                let content = turn.call(&device, &call.name, &call.arguments, &cancel).await;
+            let calls: Vec<_> = response.calls.values().collect();
+            let outcomes = join_all(
+                calls
+                    .iter()
+                    .map(|call| device.call(&call.name, &call.arguments, &cancel)),
+            )
+            .await;
+            for (call, outcome) in calls.into_iter().zip(outcomes) {
+                let content = turn.record_result(&call.name, outcome);
                 messages.push(json!({"role":"tool", "tool_call_id":call.id, "content":content}));
             }
         }

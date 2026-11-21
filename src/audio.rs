@@ -1,6 +1,6 @@
 use audiopus::coder::{Decoder, Encoder};
 use audiopus::packet::Packet;
-use audiopus::{Application, Channels, MutSignals, SampleRate};
+use audiopus::{Application, Bitrate, Channels, MutSignals, SampleRate, Signal};
 
 /// 设备上行：16k 单声道 Opus → PCM16
 pub struct OpusIn {
@@ -31,11 +31,13 @@ impl OpusIn {
     }
 }
 
-/// 下行：PCM16（24k）→ Opus 60ms 帧
+/// 下行：PCM16（16k/24k）→ Opus 60ms 帧（支持边收 PCM 边出帧）
 pub struct OpusOut {
     enc: Encoder,
     frame_samples: usize,
     out_buf: Vec<u8>,
+    pending_pcm: Vec<i16>,
+    trailing_byte: Option<u8>,
 }
 
 impl OpusOut {
@@ -48,14 +50,21 @@ impl OpusOut {
             _ => SampleRate::Hz48000,
         };
         let frame_samples = (sample_rate as usize * frame_ms as usize) / 1000;
+        let mut enc = Encoder::new(sr, Channels::Mono, Application::Audio)?;
+        let _ = enc.set_bitrate(Bitrate::BitsPerSecond(24_000));
+        let _ = enc.set_signal(Signal::Voice);
+        let _ = enc.set_complexity(5);
         Ok(Self {
-            enc: Encoder::new(sr, Channels::Mono, Application::Audio)?,
+            enc,
             frame_samples,
             out_buf: vec![0u8; 4000],
+            pending_pcm: Vec::with_capacity(frame_samples * 2),
+            trailing_byte: None,
         })
     }
 
     /// 把任意长度的 PCM 切成 60ms 帧逐帧编码
+    #[allow(dead_code)]
     pub fn encode(&mut self, pcm: &[i16]) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
         for chunk in pcm.chunks_exact(self.frame_samples) {
@@ -67,6 +76,7 @@ impl OpusOut {
     }
 
     /// 补零到整帧后再编码（句尾用）
+    #[allow(dead_code)]
     pub fn encode_padded(&mut self, pcm: &[i16]) -> Vec<Vec<u8>> {
         let mut frames = self.encode(pcm);
         let rest = pcm.len() % self.frame_samples;
@@ -79,8 +89,57 @@ impl OpusOut {
         }
         frames
     }
+
+    /// 流式喂入小端 PCM16 字节，凑齐整帧立即编码返回
+    pub fn push_pcm_bytes(&mut self, mut bytes: &[u8]) -> Vec<Vec<u8>> {
+        if let Some(lo) = self.trailing_byte.take() {
+            if let Some((&hi, rest)) = bytes.split_first() {
+                self.pending_pcm.push(i16::from_le_bytes([lo, hi]));
+                bytes = rest;
+            } else {
+                self.trailing_byte = Some(lo);
+                return Vec::new();
+            }
+        }
+        let pairs = bytes.len() / 2;
+        self.pending_pcm.reserve(pairs);
+        for pair in bytes[..pairs * 2].chunks_exact(2) {
+            self.pending_pcm.push(i16::from_le_bytes([pair[0], pair[1]]));
+        }
+        if bytes.len() % 2 == 1 {
+            self.trailing_byte = Some(bytes[bytes.len() - 1]);
+        }
+        let mut frames = Vec::new();
+        let full_samples = (self.pending_pcm.len() / self.frame_samples) * self.frame_samples;
+        if full_samples > 0 {
+            for chunk in self.pending_pcm[..full_samples].chunks_exact(self.frame_samples) {
+                if let Ok(n) = self.enc.encode(chunk, &mut self.out_buf) {
+                    frames.push(self.out_buf[..n].to_vec());
+                }
+            }
+            self.pending_pcm.drain(..full_samples);
+        }
+        frames
+    }
+
+    /// 句尾冲刷：把不足一帧的剩余样本补零编码
+    pub fn finish_stream(&mut self) -> Option<Vec<u8>> {
+        self.trailing_byte = None;
+        if self.pending_pcm.is_empty() {
+            return None;
+        }
+        self.pending_pcm.resize(self.frame_samples, 0);
+        let frame = self
+            .enc
+            .encode(&self.pending_pcm[..self.frame_samples], &mut self.out_buf)
+            .ok()
+            .map(|n| self.out_buf[..n].to_vec());
+        self.pending_pcm.clear();
+        frame
+    }
 }
 
+#[allow(dead_code)]
 pub fn bytes_to_i16(bytes: &[u8]) -> Vec<i16> {
     bytes
         .chunks_exact(2)
@@ -121,4 +180,23 @@ mod tests {
         assert_eq!(dec.decode(&frames[0]).unwrap().len(), 960);
     }
 
+    #[test]
+    fn streaming_push_pcm_bytes_handles_unaligned_chunks_and_tail() {
+        let mut enc = OpusOut::new(16000, 60).unwrap();
+        // 1.5 frames (1440 samples = 2880 bytes), split across odd-sized chunks.
+        let pcm = sine(16000, 90);
+        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut frames = Vec::new();
+        for chunk in bytes.chunks(333) {
+            frames.extend(enc.push_pcm_bytes(chunk));
+        }
+        assert_eq!(frames.len(), 1, "first 60ms frame should emit before flush");
+        let tail = enc.finish_stream().expect("remaining 30ms should zero-pad");
+        frames.push(tail);
+        assert_eq!(frames.len(), 2);
+        let mut dec = OpusIn::new(16000).unwrap();
+        for frame in &frames {
+            assert_eq!(dec.decode(frame).unwrap().len(), 960);
+        }
+    }
 }

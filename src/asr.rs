@@ -35,7 +35,7 @@ const COMPRESS_GZIP: u8 = 0x01;
 const FLAG_SEQUENCE: u8 = 0x01;
 const FLAG_LAST: u8 = 0x02;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-const ASR_PACKET_MS: u32 = 180;
+const ASR_PACKET_MS: u32 = 120;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Flush 后等最终结果的步数（100ms/步）。豆包正常 <1s，给到 10s，
@@ -43,7 +43,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const FLUSH_WAIT_STEPS: usize = 100;
 
 fn gzip(data: &[u8]) -> Result<Vec<u8>> {
-    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     enc.write_all(data)?;
     Ok(enc.finish()?)
 }
@@ -259,7 +259,7 @@ impl DoubaoAsr {
         h.insert("X-Api-Connect-Id", request_id.parse()?);
         let config = WebSocketConfig::default().max_message_size(Some(MAX_RESPONSE_BYTES));
         let (mut ws, response) =
-            tokio_tungstenite::connect_async_with_config(req, Some(config), false).await?;
+            tokio_tungstenite::connect_async_with_config(req, Some(config), true).await?;
         let log_id = response
             .headers()
             .get("X-Tt-Logid")
@@ -428,7 +428,23 @@ pub async fn run_asr(
         };
         if let AsrCmd::Start(turn) = cmd {
             asr.reset();
-            active = Some(turn);
+            active = Some(turn.clone());
+            // Pre-connect ASR WS during pre-speech silence so the ~270ms TLS+init handshake
+            // overlaps with the user starting to speak instead of blocking the first audio frames.
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = turn.cancelled() => {
+                    asr.reset();
+                    active = None;
+                }
+                res = asr.connect() => {
+                    if let Err(e) = res {
+                        debug!("ASR 预建连失败，首包重试: {e:#}");
+                        asr.reset();
+                    }
+                }
+            }
             continue;
         }
         let Some(turn) = active.clone() else { continue };
@@ -550,9 +566,9 @@ mod tests {
             .await
             .unwrap();
 
-            let audio = ws.next().await.unwrap().unwrap().into_data();
-            assert_eq!(&audio[..8], &[0x11, 0x21, 0x01, 0, 0, 0, 0, 2]);
-            assert_eq!(gunzip(&audio[12..]).unwrap().len(), 3 * 960 * 2);
+            let audio1 = ws.next().await.unwrap().unwrap().into_data();
+            assert_eq!(&audio1[..8], &[0x11, 0x21, 0x01, 0, 0, 0, 0, 2]);
+            assert_eq!(gunzip(&audio1[12..]).unwrap().len(), 2 * 960 * 2);
             let partial =
                 json!({"result":{"text":"现在","utterances":[{"text":"现在","definite":true}]}});
             ws.send(Message::Binary(
@@ -563,13 +579,17 @@ mod tests {
             .await
             .unwrap();
 
+            let audio2 = ws.next().await.unwrap().unwrap().into_data();
+            assert_eq!(&audio2[..8], &[0x11, 0x21, 0x01, 0, 0, 0, 0, 3]);
+            assert_eq!(gunzip(&audio2[12..]).unwrap().len(), 2 * 960 * 2);
+
             let terminal = ws.next().await.unwrap().unwrap().into_data();
             assert_eq!(&terminal[..4], &[0x11, 0x23, 0x01, 0]);
-            assert_eq!(&terminal[4..8], &(-3i32).to_be_bytes());
-            assert_eq!(gunzip(&terminal[12..]).unwrap().len(), 2 * 960 * 2);
+            assert_eq!(&terminal[4..8], &(-4i32).to_be_bytes());
+            assert_eq!(gunzip(&terminal[12..]).unwrap().len(), 960 * 2);
             let result = json!({"code":20000000,"result":{"text":"现在几点了？"}});
             ws.send(Message::Binary(
-                frame(9, true, Some(3), &serde_json::to_vec(&result).unwrap())
+                frame(9, true, Some(4), &serde_json::to_vec(&result).unwrap())
                     .unwrap()
                     .into(),
             ))

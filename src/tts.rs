@@ -1,3 +1,4 @@
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -5,6 +6,7 @@ use base64::Engine;
 use reqwest::header::HeaderValue;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::config::{credential_missing, TtsCfg};
@@ -12,7 +14,22 @@ use crate::config::{credential_missing, TtsCfg};
 const MAX_V3_BODY: usize = 8 * 1024 * 1024;
 const SYNTH_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// 豆包 HTTP 语音合成。V3 分块响应拼为整句 PCM，供会话层发送。
+fn shared_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .pool_idle_timeout(Duration::from_secs(90))
+                .tcp_nodelay(true)
+                .build()
+                .expect("build TTS HTTP client")
+        })
+        .clone()
+}
+
+/// 豆包 HTTP 语音合成。V3 支持边收分块边吐出 PCM，降低首音延迟。
+#[derive(Clone)]
 pub struct DoubaoTts {
     cfg: TtsCfg,
     client: reqwest::Client,
@@ -22,26 +39,66 @@ impl DoubaoTts {
     pub fn new(cfg: TtsCfg) -> Self {
         Self {
             cfg,
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("build TTS HTTP client"),
+            client: shared_http_client(),
         }
     }
 
-    /// 返回裸 PCM16（24k 单声道）字节；若服务端返回 wav 会自动剥头
+    /// V3 可按设备协商采样率直接输出（16k 省 33% 下载与编码）；V1 默认 24k。
+    pub fn preferred_sample_rate(&self, negotiated: u32) -> u32 {
+        if self.cfg.speech_api_key.is_some() {
+            match negotiated {
+                8000 | 16000 | 24000 => negotiated,
+                _ => 24_000,
+            }
+        } else {
+            24_000
+        }
+    }
+
+    /// 返回整句裸 PCM16（24k 单声道）字节；供测试和简单调用复用。
+    #[allow(dead_code)]
     pub async fn synth(&self, text: &str) -> Result<Vec<u8>> {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+        let producer = self.synth_stream(text, 24_000, tx);
+        let consumer = async {
+            let mut audio = Vec::new();
+            while let Some(chunk) = rx.recv().await {
+                audio.extend_from_slice(&chunk);
+            }
+            Ok::<_, anyhow::Error>(audio)
+        };
+        let ((), audio) = tokio::try_join!(producer, consumer)?;
+        Ok(audio)
+    }
+
+    /// 流式合成：每收到一块 PCM 立即写入 `tx`，无需等整句下载完成。
+    pub async fn synth_stream(
+        &self,
+        text: &str,
+        sample_rate: u32,
+        tx: mpsc::Sender<Vec<u8>>,
+    ) -> Result<()> {
         let text = text.trim();
         if text.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         if let Some(key) = &self.cfg.speech_api_key {
-            return self.synth_v3(text, key).await;
+            return self.synth_v3_stream(text, key, sample_rate, tx).await;
         }
-        self.synth_v1(text).await
+        let pcm = self.synth_v1(text).await?;
+        if !pcm.is_empty() {
+            let _ = tx.send(pcm).await;
+        }
+        Ok(())
     }
 
-    async fn synth_v3(&self, text: &str, key: &str) -> Result<Vec<u8>> {
+    async fn synth_v3_stream(
+        &self,
+        text: &str,
+        key: &str,
+        sample_rate: u32,
+        tx: mpsc::Sender<Vec<u8>>,
+    ) -> Result<()> {
         ensure!(
             !credential_missing(key),
             "请在 [speech] 填写豆包语音项目 API Key"
@@ -59,7 +116,7 @@ impl DoubaoTts {
                 "req_params": {
                     "text": text,
                     "speaker": self.cfg.voice,
-                    "audio_params": { "format": "pcm", "sample_rate": 24000 }
+                    "audio_params": { "format": "pcm", "sample_rate": sample_rate }
                 }
             }))
             .timeout(SYNTH_TIMEOUT)
@@ -76,7 +133,7 @@ impl DoubaoTts {
             status.is_success(),
             "TTS V3 HTTP {status}（LogID {log_id}）"
         );
-        read_v3_audio(response)
+        stream_v3_audio(response, tx)
             .await
             .with_context(|| format!("TTS V3（LogID {log_id}）"))
     }
@@ -134,9 +191,9 @@ struct TtsChunk {
     data: Option<String>,
 }
 
-fn append_v3_chunk(line: &[u8], audio: &mut Vec<u8>) -> Result<bool> {
+fn decode_v3_chunk(line: &[u8]) -> Result<(Option<Vec<u8>>, bool)> {
     if line.iter().all(u8::is_ascii_whitespace) {
-        return Ok(false);
+        return Ok((None, false));
     }
     let chunk: TtsChunk = serde_json::from_slice(line).context("TTS 分块 JSON 无效")?;
     let complete = chunk.code == 20_000_000;
@@ -149,16 +206,22 @@ fn append_v3_chunk(line: &[u8], audio: &mut Vec<u8>) -> Result<bool> {
             .collect();
         bail!("TTS 返回错误 code={}: {message}", chunk.code);
     }
-    if let Some(data) = chunk.data {
-        audio.extend(base64::engine::general_purpose::STANDARD.decode(data)?);
-    }
-    Ok(complete)
+    let audio = match chunk.data {
+        Some(data) if !data.is_empty() => {
+            Some(base64::engine::general_purpose::STANDARD.decode(data)?)
+        }
+        _ => None,
+    };
+    Ok((audio, complete))
 }
 
-async fn read_v3_audio(mut response: reqwest::Response) -> Result<Vec<u8>> {
+async fn stream_v3_audio(
+    mut response: reqwest::Response,
+    tx: mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
     let mut line = Vec::new();
-    let mut audio = Vec::new();
-    let mut received = 0;
+    let mut received = 0usize;
+    let mut total_pcm = 0usize;
     let mut complete = false;
     'response: while let Some(bytes) = response.chunk().await? {
         received += bytes.len();
@@ -166,23 +229,35 @@ async fn read_v3_audio(mut response: reqwest::Response) -> Result<Vec<u8>> {
         for part in bytes.split_inclusive(|byte| *byte == b'\n') {
             line.extend_from_slice(part);
             if part.ends_with(b"\n") {
-                if append_v3_chunk(&line, &mut audio)? {
+                let (audio, done) = decode_v3_chunk(&line)?;
+                line.clear();
+                if let Some(pcm) = audio {
+                    total_pcm += pcm.len();
+                    if tx.send(pcm).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                if done {
                     complete = true;
                     break 'response;
                 }
-                line.clear();
             }
         }
     }
     if !complete {
-        complete = append_v3_chunk(&line, &mut audio)?;
+        let (audio, done) = decode_v3_chunk(&line)?;
+        if let Some(pcm) = audio {
+            total_pcm += pcm.len();
+            let _ = tx.send(pcm).await;
+        }
+        complete = done;
     }
     ensure!(complete, "TTS 响应缺少结束标记");
     ensure!(
-        !audio.is_empty() && audio.len() % 2 == 0,
+        total_pcm > 0 && total_pcm % 2 == 0,
         "TTS 返回空或不完整的 PCM16"
     );
-    Ok(audio)
+    Ok(())
 }
 
 /// 解析 TTS 返回：pcm 裸流直接用；wav 则跳过 RIFF 头

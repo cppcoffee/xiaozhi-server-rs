@@ -2,7 +2,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -12,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 use crate::config::LogCfg;
 
 const FILE_NAME: &str = "xiaozhi.log";
+const ASYNC_LOG_QUEUE: usize = 1024;
 
 /// 初始化日志：等级取 RUST_LOG 或配置，文件写到 log.dir（默认 ./logs）
 pub fn init(cfg: &LogCfg) {
@@ -19,7 +22,11 @@ pub fn init(cfg: &LogCfg) {
     let stdout = tracing_subscriber::fmt::layer();
     let max_bytes = cfg.max_mb.saturating_mul(1024 * 1024);
     let files = match RotatingFile::new(&cfg.dir, cfg.keep, max_bytes) {
-        Ok(w) => Some(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(w)),
+        Ok(w) => Some(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(AsyncFileWriter::spawn(w)),
+        ),
         Err(e) => {
             eprintln!("日志目录不可用（{}），只写 stdout：{e}", cfg.dir);
             None
@@ -30,6 +37,61 @@ pub fn init(cfg: &LogCfg) {
         .with(stdout)
         .with(files)
         .init();
+}
+
+/// 异步文件写入器：把磁盘写与轮转挪到独立后台线程，避免阻塞 Tokio 工作线程。
+#[derive(Clone)]
+struct AsyncFileWriter {
+    tx: Arc<SyncSender<Vec<u8>>>,
+}
+
+impl AsyncFileWriter {
+    fn spawn(file: RotatingFile) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(ASYNC_LOG_QUEUE);
+        let _ = thread::Builder::new()
+            .name("xiaozhi-log".into())
+            .spawn(move || {
+                while let Ok(buf) = rx.recv() {
+                    let _ = file.write_bytes(&buf);
+                }
+            });
+        Self { tx: Arc::new(tx) }
+    }
+}
+
+struct AsyncGuard {
+    tx: Arc<SyncSender<Vec<u8>>>,
+    buf: Vec<u8>,
+}
+
+impl<'a> MakeWriter<'a> for AsyncFileWriter {
+    type Writer = AsyncGuard;
+
+    fn make_writer(&'a self) -> AsyncGuard {
+        AsyncGuard {
+            tx: self.tx.clone(),
+            buf: Vec::with_capacity(256),
+        }
+    }
+}
+
+impl Write for AsyncGuard {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for AsyncGuard {
+    fn drop(&mut self) {
+        if !self.buf.is_empty() {
+            let _ = self.tx.try_send(std::mem::take(&mut self.buf));
+        }
+    }
 }
 
 /// 超过 max_bytes 就把 当前→.1、.1→.2 …，只保留 keep 个文件

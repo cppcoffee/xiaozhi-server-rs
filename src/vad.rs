@@ -40,9 +40,14 @@ impl EnergyVad {
         self.speaking
     }
 
+    #[allow(dead_code)]
     pub fn push(&mut self, pcm: &[i16]) -> VadEvent {
-        let rms = rms(pcm);
-        let voiced = rms >= self.threshold;
+        self.push_with_rms(pcm).0
+    }
+
+    pub fn push_with_rms(&mut self, pcm: &[i16]) -> (VadEvent, f64) {
+        let level = rms(pcm);
+        let voiced = level >= self.threshold;
 
         if !self.speaking {
             if voiced {
@@ -51,12 +56,12 @@ impl EnergyVad {
                     self.speaking = true;
                     self.silent = 0;
                     self.frames = 0;
-                    return VadEvent::StartSpeech;
+                    return (VadEvent::StartSpeech, level);
                 }
             } else {
                 self.voiced = 0;
             }
-            return VadEvent::None;
+            return (VadEvent::None, level);
         }
 
         // 说话中
@@ -71,9 +76,9 @@ impl EnergyVad {
             self.speaking = false;
             self.voiced = 0;
             self.silent = 0;
-            return VadEvent::EndSpeech(capped);
+            return (VadEvent::EndSpeech(capped), level);
         }
-        VadEvent::None
+        (VadEvent::None, level)
     }
 }
 

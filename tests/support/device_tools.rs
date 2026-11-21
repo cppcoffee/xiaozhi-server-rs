@@ -1337,11 +1337,13 @@ async fn total_turn_deadline_stops_playback_even_after_first_audio_succeeded() {
     let (server, fake) = llm_server(vec![answer_sse("不会无限延长的播放。")]).await;
     let mut events = delayed_cloud(&fake, &[0], &[0]);
     fake.audio_frames
-        .store(2, std::sync::atomic::Ordering::SeqCst);
+        .store(3, std::sync::atomic::Ordering::SeqCst);
     let (shared, mut output) = turn_shared(&rig, &server);
     let task = start_turn(&shared);
     assert_eq!(events.recv().await, Some("llm"));
     assert_eq!(events.recv().await, Some("tts"));
+    // Consume the two immediate pre-buffer frames; frame 3 waits on the 60 ms pacer deadline.
+    turn_audio(&mut output).await;
     turn_audio(&mut output).await;
     tokio::task::yield_now().await;
     // Simulate delayed scheduling/backpressure in playback; its first audio has
@@ -1360,6 +1362,30 @@ async fn total_turn_deadline_stops_playback_even_after_first_audio_succeeded() {
     assert!(shared.history.lock().await.is_empty());
     clock.advance(10).await;
     assert!(output.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn real_ws_idle_timeout_sends_close_frame() {
+    let (cloud, _) = llm_server(vec![]).await;
+    let server = session_server(&cloud).await;
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(server.url.replace("http://", "ws://") + "/ws")
+            .await
+            .unwrap();
+    ws_send(&mut ws, json!({"type":"hello","features":{"mcp":false}})).await;
+    assert_eq!(ws_recv(&mut ws).await["type"], "hello");
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(120)).await;
+    let message = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        message,
+        tokio_tungstenite::tungstenite::Message::Close(_)
+    ));
 }
 
 #[tokio::test]
@@ -1863,4 +1889,81 @@ async fn mid_question_pause_waits_for_device_stop() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn abort_during_audio_playback_keeps_ws_open_for_next_turn() {
+    let (cloud, fake) = llm_server(vec![
+        answer_sse("第一句很长，第二句也很长。"),
+        answer_sse("好的。"),
+    ])
+    .await;
+    fake.audio_frames
+        .store(8, std::sync::atomic::Ordering::SeqCst);
+    let server = session_server(&cloud).await;
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(server.url.replace("http://", "ws://") + "/ws")
+            .await
+            .unwrap();
+    ws_send(&mut ws, json!({"type":"hello","features":{"mcp":false}})).await;
+    assert_eq!(ws_recv(&mut ws).await["type"], "hello");
+
+    ws_send(
+        &mut ws,
+        json!({"type":"listen","mode":"manual","state":"detect","text":"讲个故事"}),
+    )
+    .await;
+    // Wait until at least one binary audio frame arrives, then abort mid-playback.
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if matches!(msg, tokio_tungstenite::tungstenite::Message::Binary(_)) {
+            break;
+        }
+    }
+    ws_send(&mut ws, json!({"type":"abort"})).await;
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+            let v: Value = serde_json::from_str(&text).unwrap();
+            if v["type"] == "tts" && v["state"] == "stop" {
+                break;
+            }
+        }
+    }
+    // Same WebSocket must still be alive and handle the next turn.
+    fake.audio_frames
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    ws_send(
+        &mut ws,
+        json!({"type":"listen","mode":"manual","state":"detect","text":"你好"}),
+    )
+    .await;
+    let mut got_audio = false;
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match msg {
+            tokio_tungstenite::tungstenite::Message::Binary(_) => got_audio = true,
+            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                let v: Value = serde_json::from_str(&text).unwrap();
+                if v["type"] == "tts" && v["state"] == "stop" {
+                    assert!(got_audio);
+                    break;
+                }
+            }
+            other => panic!("unexpected message after abort: {other:?}"),
+        }
+    }
+    ws.close(None).await.unwrap();
 }
