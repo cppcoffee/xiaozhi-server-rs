@@ -102,7 +102,7 @@ pub fn clean_for_tts(text: &str) -> String {
         }
     }
     if out.trim().is_empty() {
-        warn!("TTS 文本为空，跳过");
+        warn!("Skipping empty TTS text");
     }
     out.trim().to_string()
 }

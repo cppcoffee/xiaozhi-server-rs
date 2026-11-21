@@ -101,9 +101,9 @@ impl DoubaoTts {
     ) -> Result<()> {
         ensure!(
             !credential_missing(key),
-            "请在 [speech] 填写豆包语音项目 API Key"
+            "Set [speech].api_key to your Doubao voice project API key"
         );
-        let mut key = HeaderValue::from_str(key).context("[speech].api_key 格式不合法")?;
+        let mut key = HeaderValue::from_str(key).context("Invalid [speech].api_key format")?;
         key.set_sensitive(true);
         let request_id = Uuid::new_v4().to_string();
         let response = self
@@ -131,17 +131,17 @@ impl DoubaoTts {
         let status = response.status();
         ensure!(
             status.is_success(),
-            "TTS V3 HTTP {status}（LogID {log_id}）"
+            "TTS V3 HTTP {status} (LogID {log_id})"
         );
         stream_v3_audio(response, tx)
             .await
-            .with_context(|| format!("TTS V3（LogID {log_id}）"))
+            .with_context(|| format!("TTS V3 (LogID {log_id})"))
     }
 
     async fn synth_v1(&self, text: &str) -> Result<Vec<u8>> {
         ensure!(
             !credential_missing(&self.cfg.appid) && !credential_missing(&self.cfg.access_token),
-            "请填写 [tts] 的旧版 APP ID 和 Access Token，或配置 [speech].api_key"
+            "Set [tts].appid and [tts].access_token or configure [speech].api_key"
         );
         let body = json!({
             "app": {
@@ -162,7 +162,7 @@ impl DoubaoTts {
         });
 
         let mut auth = HeaderValue::from_str(&format!("Bearer;{}", self.cfg.access_token))
-            .context("[tts].access_token 格式不合法")?;
+            .context("Invalid [tts].access_token format")?;
         auth.set_sensitive(true);
         let resp = self
             .client
@@ -179,7 +179,7 @@ impl DoubaoTts {
             let raw = base64::engine::general_purpose::STANDARD.decode(data)?;
             Ok(strip_wav_header(&raw))
         } else {
-            Err(anyhow!("TTS 返回异常 {}: {}", status, v))
+            Err(anyhow!("Unexpected TTS response (HTTP {}): {}", status, v))
         }
     }
 }
@@ -195,7 +195,7 @@ fn decode_v3_chunk(line: &[u8]) -> Result<(Option<Vec<u8>>, bool)> {
     if line.iter().all(u8::is_ascii_whitespace) {
         return Ok((None, false));
     }
-    let chunk: TtsChunk = serde_json::from_slice(line).context("TTS 分块 JSON 无效")?;
+    let chunk: TtsChunk = serde_json::from_slice(line).context("Invalid TTS chunk JSON")?;
     let complete = chunk.code == 20_000_000;
     if chunk.code != 0 && !complete {
         let message: String = chunk
@@ -204,7 +204,7 @@ fn decode_v3_chunk(line: &[u8]) -> Result<(Option<Vec<u8>>, bool)> {
             .chars()
             .take(240)
             .collect();
-        bail!("TTS 返回错误 code={}: {message}", chunk.code);
+        bail!("TTS returned error code={}: {message}", chunk.code);
     }
     let audio = match chunk.data {
         Some(data) if !data.is_empty() => {
@@ -225,7 +225,7 @@ async fn stream_v3_audio(
     let mut complete = false;
     'response: while let Some(bytes) = response.chunk().await? {
         received += bytes.len();
-        ensure!(received <= MAX_V3_BODY, "TTS 响应超出大小限制");
+        ensure!(received <= MAX_V3_BODY, "TTS response exceeds the size limit");
         for part in bytes.split_inclusive(|byte| *byte == b'\n') {
             line.extend_from_slice(part);
             if part.ends_with(b"\n") {
@@ -252,10 +252,10 @@ async fn stream_v3_audio(
         }
         complete = done;
     }
-    ensure!(complete, "TTS 响应缺少结束标记");
+    ensure!(complete, "TTS response is missing its terminal marker");
     ensure!(
         total_pcm > 0 && total_pcm % 2 == 0,
-        "TTS 返回空或不完整的 PCM16"
+        "TTS returned empty or incomplete PCM16 audio"
     );
     Ok(())
 }
@@ -338,7 +338,7 @@ mod tests {
         assert!(format!("{error:#}").contains("code=45000010"));
         assert!(format!("{error:#}").contains("test-log"));
         let error = tts.synth("缺少结束标记").await.unwrap_err();
-        assert!(format!("{error:#}").contains("缺少结束标记"));
+        assert!(format!("{error:#}").contains("missing its terminal marker"));
         server.abort();
     }
 

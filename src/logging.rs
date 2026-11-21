@@ -1,4 +1,6 @@
 /// 运行日志：同时写 stdout 和按大小切片的文件
+use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -16,19 +18,69 @@ use crate::config::LogCfg;
 const FILE_NAME: &str = "xiaozhi.log";
 const ASYNC_LOG_QUEUE: usize = 1024;
 
+pub fn ascii(text: &str) -> Cow<'_, str> {
+    if text.is_ascii() {
+        return Cow::Borrowed(text);
+    }
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            escaped.push(ch);
+        } else {
+            for unit in ch.encode_utf16(&mut [0; 2]) {
+                write!(escaped, "\\u{unit:04x}").expect("writing to a String cannot fail");
+            }
+        }
+    }
+    Cow::Owned(escaped)
+}
+
+struct AsciiWriter<W>(W);
+
+impl<'a, W: MakeWriter<'a>> MakeWriter<'a> for AsciiWriter<W> {
+    type Writer = AsciiWriter<W::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        AsciiWriter(self.0.make_writer())
+    }
+}
+
+impl<W: Write> Write for AsciiWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_ascii() {
+            self.0.write_all(buf)?;
+        } else {
+            // The tracing formatter writes each formatted UTF-8 event as one buffer.
+            self.0
+                .write_all(ascii(&String::from_utf8_lossy(buf)).as_bytes())?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
 /// 初始化日志：等级取 RUST_LOG 或配置，文件写到 log.dir（默认 ./logs）
 pub fn init(cfg: &LogCfg) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.level));
-    let stdout = tracing_subscriber::fmt::layer();
+    let stdout = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(AsciiWriter(io::stdout));
     let max_bytes = cfg.max_mb.saturating_mul(1024 * 1024);
     let files = match RotatingFile::new(&cfg.dir, cfg.keep, max_bytes) {
         Ok(w) => Some(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(AsyncFileWriter::spawn(w)),
+                .with_writer(AsciiWriter(AsyncFileWriter::spawn(w))),
         ),
         Err(e) => {
-            eprintln!("日志目录不可用（{}），只写 stdout：{e}", cfg.dir);
+            let message = format!(
+                "Log directory unavailable ({}): {e}. Using stdout only.",
+                cfg.dir
+            );
+            eprintln!("{}", ascii(&message));
             None
         }
     };
@@ -193,6 +245,34 @@ impl Write for Guard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formatted_events_escape_non_ascii_payloads() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let captured = output.clone();
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(AsciiWriter(move || Capture(captured.clone())))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(device = "室🦌", "Transcript: hi 你好");
+        });
+        let bytes = output.lock().unwrap();
+        assert!(bytes.is_ascii());
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains(r"Transcript: hi \u4f60\u597d"));
+        assert!(text.contains(r"\u5ba4\ud83e\udd8c"));
+    }
 
     #[test]
     fn rotates_and_keeps_limit() {

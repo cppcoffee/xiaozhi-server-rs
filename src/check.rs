@@ -2,52 +2,43 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::config::Config;
+use crate::logging::ascii;
 use crate::tts::DoubaoTts;
 
 /// `--check`：验证三个云端接口，不启动设备服务。
 pub async fn run(cfg: &Config) -> bool {
-    println!("=== 小智 Rust Server 凭证自检 ===\n");
-    let mut ok = true;
-
-    // 1) Ark LLM
-    match check_llm(cfg).await {
-        Ok(msg) => println!("[ OK ] LLM(Ark)      {msg}"),
-        Err(e) => {
-            ok = false;
-            println!("[FAIL] LLM(Ark)      {e}");
-        }
-    }
-
-    // 2) TTS
-    match check_tts(cfg).await {
-        Ok(msg) => println!("[ OK ] TTS(豆包)     {msg}"),
-        Err(e) => {
-            ok = false;
-            println!("[FAIL] TTS(豆包)     {e:#}");
-        }
-    }
-
-    // 3) ASR
-    match crate::asr::probe(&cfg.asr, crate::config::INPUT_SAMPLE_RATE).await {
-        Ok(msg) => println!("[ OK ] ASR(豆包)     {msg}"),
-        Err(e) => {
-            ok = false;
-            println!("[FAIL] ASR(豆包)     {e:#}");
-        }
-    }
-
-    println!();
+    println!("=== Xiaozhi Rust server credential check ===\n");
+    let llm_ok = report("LLM (Ark)", check_llm(cfg).await);
+    let tts_ok = report("TTS (Doubao)", check_tts(cfg).await);
+    let asr_ok = report(
+        "ASR (Doubao)",
+        crate::asr::probe(&cfg.asr, crate::config::INPUT_SAMPLE_RATE).await,
+    );
+    let ok = llm_ok && tts_ok && asr_ok;
     if ok {
-        println!("全部通过，可以用这份配置启动服务");
+        println!("\nAll checks passed.");
     } else {
-        println!("有失败项，请修正本次使用的配置后重试");
+        println!("\nOne or more checks failed. Update the configuration and try again.");
     }
     ok
 }
 
+fn report(service: &str, result: Result<String>) -> bool {
+    match result {
+        Ok(message) => {
+            println!("[ OK ] {service:<12} {}", ascii(&message));
+            true
+        }
+        Err(error) => {
+            println!("[FAIL] {service:<12} {}", ascii(&format!("{error:#}")));
+            false
+        }
+    }
+}
+
 async fn check_llm(cfg: &Config) -> Result<String> {
     if cfg.llm.api_key.contains("你的") {
-        anyhow::bail!("llm.api_key 还是占位符");
+        anyhow::bail!("llm.api_key is a placeholder");
     }
     let url = format!(
         "{}/chat/completions",
@@ -68,15 +59,15 @@ async fn check_llm(cfg: &Config) -> Result<String> {
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.unwrap_or(json!({}));
     if status.is_success() {
-        Ok(format!("model={} 调用成功", cfg.llm.model))
+        Ok(format!("Model request succeeded (model={})", cfg.llm.model))
     } else if status.as_u16() == 404 {
         anyhow::bail!(
-            "model={} 不存在。若使用推理接入点，把 llm.model 改成 ep-xxxxxxxx；原始响应: {}",
+            "Model {} was not found. For an inference endpoint, set llm.model to ep-xxxxxxxx. Response: {}",
             cfg.llm.model,
             body
         )
     } else {
-        anyhow::bail!("HTTP {} — {}", status, body)
+        anyhow::bail!("HTTP {}: {}", status, body)
     }
 }
 
@@ -84,14 +75,16 @@ async fn check_tts(cfg: &Config) -> Result<String> {
     let tts = DoubaoTts::new(cfg.tts.clone());
     let pcm = tts.synth("你好，我是小智").await?;
     if pcm.is_empty() {
-        anyhow::bail!("返回音频为空，检查音色是否已购买");
+        anyhow::bail!(
+            "No audio returned. Check that the project has access to the configured voice."
+        );
     }
     // 24k 单声道 16bit
     let ms = pcm.len() as f64 / (24000.0 * 2.0) * 1000.0;
     Ok(format!(
-        "voice={} 合成 {} 字节（约 {:.0}ms 音频）",
-        cfg.tts.voice,
+        "Synthesized {} bytes (about {:.0} ms of audio) with voice={}",
         pcm.len(),
-        ms
+        ms,
+        cfg.tts.voice
     ))
 }

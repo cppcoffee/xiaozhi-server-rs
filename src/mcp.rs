@@ -260,7 +260,7 @@ impl DeviceMcp {
         let this = self.clone();
         tokio::spawn(async move {
             if let Err(e) = this.run(rx).await {
-                warn!("设备 MCP 不可用: {e:#}");
+                warn!("Device MCP is unavailable: {e:#}");
             }
             this.state.send_replace(State::Unavailable);
         });

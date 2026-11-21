@@ -166,7 +166,7 @@ pub async fn ws_handler(
 /// 一条 websocket 连接的完整生命周期
 pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: String) {
     let session_id = Uuid::new_v4().to_string();
-    info!("设备连接: device_id={device_id} session_id={session_id}");
+    info!("Device connected: device_id={device_id} session_id={session_id}");
 
     let (sink, mut stream) = sock.split();
     let (ws_tx, ws_rx) = mpsc::channel::<Message>(512);
@@ -271,7 +271,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                         shared.send_tts_state("stop", None).await;
                         continue;
                     }
-                    info!("[{}] 用户结束会话: {text}", shared.device_id);
+                    info!("[{}] User ended the session: {text}", shared.device_id);
                     shared
                         .send_json(crate::protocol::stt_text(&text, &shared.session_id))
                         .await;
@@ -285,7 +285,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                 }
                 let output_sr = tts.preferred_sample_rate(negotiated_sr.load(Ordering::Relaxed));
                 if let Err(e) = run_turn_with_rate(&shared, &tts, text, turn, output_sr).await {
-                    error!("回合处理失败: {e}");
+                    error!("Failed to process the turn: {e}");
                 }
             }
         })
@@ -295,7 +295,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
     let mut decoder = match OpusIn::new(crate::config::INPUT_SAMPLE_RATE) {
         Ok(d) => d,
         Err(e) => {
-            error!("Opus 解码器初始化失败: {e}");
+            error!("Failed to initialize the Opus decoder: {e}");
             return;
         }
     };
@@ -317,7 +317,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                 if shared.turn_cancel.lock().await.is_some() {
                     continue; // 正在回话，不算空闲
                 }
-                info!("空闲 {}s，关闭连接回收资源", IDLE_TIMEOUT.as_secs());
+                info!("Closing WebSocket after {} seconds of inactivity", IDLE_TIMEOUT.as_secs());
                 // Give the writer a chance to send Close before cancelling it.
                 if shared.ws_tx.try_send(Message::Close(None)).is_ok() {
                     let _ = tokio::time::timeout(Duration::from_secs(1), closed.cancelled()).await;
@@ -328,7 +328,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
         let msg = match msg {
             Some(Ok(m)) => m,
             Some(Err(e)) => {
-                warn!("websocket 读错误: {e}");
+                warn!("WebSocket read failed: {e}");
                 break;
             }
             None => break,
@@ -402,7 +402,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                                         })
                                         .is_err()
                                     {
-                                        warn!("手动文本队列已满，关闭连接");
+                                        warn!("Manual input queue is full. Closing the connection.");
                                         closed.cancel();
                                     }
                                 }
@@ -411,13 +411,13 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                         }
                     }
                     "abort" => {
-                        info!("收到 abort，打断当前回合");
+                        info!("Received abort. Cancelling the current turn.");
                         shared.abort_turn(input.take()).await;
                         listening = false;
                         speech_started = false;
                     }
                     "goodbye" => {
-                        debug!("设备发送 goodbye");
+                        debug!("Device sent goodbye");
                         listening = false;
                         speech_started = false;
                     }
@@ -426,16 +426,16 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                     }
                     "mcp" => shared.mcp.receive(&v),
                     "iot" => {
-                        debug!("忽略不支持的消息类型: {}", v["type"]);
+                        debug!("Ignoring unsupported message type: {}", v["type"]);
                     }
-                    other => debug!("未知消息类型: {other}"),
+                    other => debug!("Unknown message type: {other}"),
                 }
             }
             Message::Binary(b) if listening => {
                 let pcm = match decoder.decode(&b) {
                     Ok(p) => p.to_vec(),
                     Err(e) => {
-                        debug!("Opus 解码失败: {e}");
+                        debug!("Failed to decode Opus packet: {e}");
                         continue;
                     }
                 };
@@ -445,7 +445,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                 match event {
                     VadEvent::StartSpeech => {
                         if !speech_started {
-                            info!("检测到说话开始");
+                            info!("Speech detected");
                             speech_started = true;
                             if pre_roll
                                 .drain(..)
@@ -474,13 +474,13 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                         // listen stop 收尾；但保持继续向云端 ASR 转发静音帧，避免句中吞字
                         // 并让云端提前完成尾音解码，只在上限（20s）时强制截断。
                         if !capped {
-                            debug!("检测到停顿，继续转发音频并等待设备结束录音");
+                            debug!("Pause detected. Forwarding audio while waiting for the device to stop listening.");
                             if asr_tx.try_send(AsrCmd::Pcm(pcm)).is_err() {
                                 closed.cancel();
                             }
                             continue;
                         }
-                        info!("输入达到录音上限，强制结束");
+                        info!("Ending input at the recording duration limit");
                         listening = false;
                         speech_started = false;
                         if asr_tx.try_send(AsrCmd::Pcm(pcm)).is_err()
@@ -496,7 +496,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
         }
     }
 
-    info!("设备断开: {device_id}");
+    info!("Device disconnected: {device_id}");
     closed.cancel();
     asr_cancel.cancel();
     shared.abort_turn(input.take()).await;
@@ -559,7 +559,7 @@ pub(crate) async fn run_turn_with_rate(
     normal_cancel.cancel();
     if !token.is_cancelled() && !shared.closed.is_cancelled() {
         if let Err(e) = &result {
-            error!("对话失败（未生成实时读数）: {e:#}");
+            error!("Conversation failed: {e:#}");
             let text = if timed_out {
                 TIMEOUT_REPLY
             } else {
@@ -630,7 +630,7 @@ async fn run_turn_inner(
     budget: &TurnBudget,
     output_sample_rate: u32,
 ) -> Result<Vec<Value>> {
-    info!("[{}] 用户: {user_text}", shared.device_id);
+    info!("[{}] User: {user_text}", shared.device_id);
     shared
         .send_json(crate::protocol::stt_text(&user_text, &shared.session_id))
         .await;

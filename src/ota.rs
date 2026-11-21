@@ -113,6 +113,6 @@ pub async fn handler(
         .unwrap_or_else(|| "0.0.0".to_string());
 
     let host = headers.get("host").and_then(|v| v.to_str().ok());
-    info!("OTA 请求 device_id={device_id} client_id={client_id} version={version}");
+    info!("OTA request: device_id={device_id} client_id={client_id} version={version}");
     Json(response(&cfg, &version, host))
 }

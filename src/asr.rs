@@ -53,7 +53,10 @@ fn gunzip(data: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     dec.take(MAX_RESPONSE_BYTES as u64 + 1)
         .read_to_end(&mut out)?;
-    ensure!(out.len() <= MAX_RESPONSE_BYTES, "ASR 解压响应超出大小限制");
+    ensure!(
+        out.len() <= MAX_RESPONSE_BYTES,
+        "Decompressed ASR response exceeds the size limit"
+    );
     Ok(out)
 }
 
@@ -85,18 +88,21 @@ fn frame(msg_type: u8, last: bool, sequence: Option<i32>, payload: &[u8]) -> Res
 
 /// 解析服务端返回帧
 fn parse_frame(res: &[u8], legacy: bool) -> Result<(Value, bool)> {
-    ensure!(res.len() >= 4 && res[0] >> 4 == 1, "ASR 响应帧头无效");
+    ensure!(
+        res.len() >= 4 && res[0] >> 4 == 1,
+        "Invalid ASR response header"
+    );
     let header_size = usize::from(res[0] & 0x0f) * 4;
     ensure!(
         header_size >= 4 && res.len() >= header_size,
-        "ASR 响应帧头不完整"
+        "Incomplete ASR response header"
     );
     let msg_type = res[1] >> 4;
     let flags = res[1] & 0x0f;
     let compress = res[2] & 0x0f;
     ensure!(
         matches!(msg_type, 0x09 | 0x0f),
-        "ASR 响应类型未知: {msg_type}"
+        "Unknown ASR response type: {msg_type}"
     );
     let mut data = &res[header_size..];
     let error_code = if msg_type == 0x0f {
@@ -108,24 +114,29 @@ fn parse_frame(res: &[u8], legacy: bool) -> Result<(Value, bool)> {
         None
     };
     let len = read_u32(&mut data)? as usize;
-    ensure!(len == data.len(), "ASR 响应数据长度无效");
+    ensure!(len == data.len(), "Invalid ASR response payload length");
     let decompressed;
     if compress == COMPRESS_GZIP {
         decompressed = gunzip(data)?;
         data = &decompressed;
     } else {
-        ensure!(compress == 0, "ASR 响应压缩格式未知: {compress}");
+        ensure!(
+            compress == 0,
+            "Unknown ASR response compression format: {compress}"
+        );
     }
     if let Some(code) = error_code {
         let message: String = String::from_utf8_lossy(data).chars().take(240).collect();
-        bail!("ASR 错误 code={code}: {message}");
+        bail!("ASR returned error code={code}: {message}");
     }
-    let value = serde_json::from_slice(data).context("ASR 响应 JSON 无效")?;
+    let value = serde_json::from_slice(data).context("Invalid ASR response JSON")?;
     Ok((value, flags & FLAG_LAST != 0))
 }
 
 fn read_u32(data: &mut &[u8]) -> Result<u32> {
-    let (bytes, rest) = data.split_first_chunk().context("ASR 响应字段不完整")?;
+    let (bytes, rest) = data
+        .split_first_chunk()
+        .context("Incomplete ASR response field")?;
     *data = rest;
     Ok(u32::from_be_bytes(*bytes))
 }
@@ -220,11 +231,11 @@ impl DoubaoAsr {
         self.ws = Some(
             tokio::time::timeout(CONNECT_TIMEOUT, self.open())
                 .await
-                .context("ASR 建连或初始化超时")??,
+                .context("ASR connection or initialization timed out")??,
         );
         self.next_sequence = self.cfg.speech_api_key.as_ref().map(|_| 2);
         info!(
-            "ASR 连接已建立 ({} / {})",
+            "ASR connection established ({} / {})",
             self.cfg.ws_url, self.cfg.resource_id
         );
         Ok(())
@@ -238,20 +249,20 @@ impl DoubaoAsr {
         if let Some(key) = &self.cfg.speech_api_key {
             ensure!(
                 !credential_missing(key),
-                "请在 [speech] 填写豆包语音项目 API Key"
+                "Set [speech].api_key to your Doubao voice project API key"
             );
-            let mut key = HeaderValue::from_str(key).context("[speech].api_key 格式不合法")?;
+            let mut key = HeaderValue::from_str(key).context("Invalid [speech].api_key format")?;
             key.set_sensitive(true);
             h.insert("X-Api-Key", key);
             h.insert("X-Api-Request-Id", request_id.parse()?);
         } else {
             ensure!(
                 !credential_missing(&self.cfg.appid) && !credential_missing(&self.cfg.access_token),
-                "请填写 [asr] 的旧版 APP ID 和 Access Token，或配置 [speech].api_key"
+                "Set [asr].appid and [asr].access_token or configure [speech].api_key"
             );
             h.insert("X-Api-App-Key", self.cfg.appid.parse()?);
             let mut token = HeaderValue::from_str(&self.cfg.access_token)
-                .context("[asr].access_token 格式不合法")?;
+                .context("Invalid [asr].access_token format")?;
             token.set_sensitive(true);
             h.insert("X-Api-Access-Key", token);
         }
@@ -277,22 +288,25 @@ impl DoubaoAsr {
             match msg? {
                 Message::Binary(bytes) => {
                     let (value, last) = parse_frame(&bytes, !modern)
-                        .with_context(|| format!("ASR 初始化失败（LogID {log_id}）"))?;
-                    ensure!(!last, "ASR 初始化收到结束帧（LogID {log_id}）");
+                        .with_context(|| format!("ASR initialization failed (LogID {log_id})"))?;
+                    ensure!(
+                        !last,
+                        "ASR received a terminal frame during initialization (LogID {log_id})"
+                    );
                     if let Some(code) = value["code"].as_i64() {
                         ensure!(
                             matches!(code, 0 | 1000 | 20_000_000),
-                            "ASR 初始化失败 code={code}（LogID {log_id}）"
+                            "ASR initialization failed with code={code} (LogID {log_id})"
                         );
                     }
-                    debug!("ASR 初始化成功（LogID {log_id}）");
+                    debug!("ASR initialization succeeded (LogID {log_id})");
                     return Ok(ws);
                 }
                 Message::Ping(_) | Message::Pong(_) => {}
                 _ => break,
             }
         }
-        bail!("ASR 初始化无有效响应（LogID {log_id}）")
+        bail!("ASR initialization returned no valid response (LogID {log_id})")
     }
 
     async fn send_pcm(&mut self, pcm: &[i16]) -> Result<()> {
@@ -365,7 +379,7 @@ async fn drain_pending(asr: &mut DoubaoAsr, wait_ms: u64) -> Result<Option<Strin
                 if let Some(code) = value["code"].as_i64() {
                     ensure!(
                         matches!(code, 0 | 1000 | 1013 | 20_000_000),
-                        "ASR 识别失败 code={code}"
+                        "ASR recognition failed with code={code}"
                     );
                 }
                 if modern {
@@ -381,11 +395,11 @@ async fn drain_pending(asr: &mut DoubaoAsr, wait_ms: u64) -> Result<Option<Strin
                             .map(str::to_owned)
                             .or_else(|| asr.confirmed_text.take())
                             .unwrap_or_default();
-                        info!("ASR 识别: {final_text}");
+                        info!("ASR final transcript: {final_text}");
                         return Ok(Some(final_text));
                     }
                 } else if let Some(recognized) = extract_text(&value) {
-                    info!("ASR 识别: {recognized}");
+                    info!("ASR transcript: {recognized}");
                     text = Some(recognized);
                 }
             }
@@ -440,7 +454,7 @@ pub async fn run_asr(
                 }
                 res = asr.connect() => {
                     if let Err(e) = res {
-                        debug!("ASR 预建连失败，首包重试: {e:#}");
+                        debug!("ASR preconnect failed. Retrying on the first audio packet: {e:#}");
                         asr.reset();
                     }
                 }
@@ -478,7 +492,7 @@ async fn read_result(asr: &mut DoubaoAsr, cmd: AsrCmd) -> Option<String> {
     let result = match cmd {
         AsrCmd::Pcm(pcm) => {
             if let Err(e) = asr.send_pcm(&pcm).await {
-                error!("发送 ASR 音频失败: {e:#}");
+                error!("Failed to send audio to ASR: {e:#}");
                 asr.reset();
                 return asr.cfg.speech_api_key.as_ref().map(|_| String::new());
             }
@@ -510,7 +524,7 @@ async fn read_result(asr: &mut DoubaoAsr, cmd: AsrCmd) -> Option<String> {
     match result {
         Ok(text) => text,
         Err(error) => {
-            warn!("ASR 识别链路失败: {error:#}");
+            warn!("ASR stream failed: {error:#}");
             asr.reset();
             Some(String::new())
         }
@@ -522,7 +536,10 @@ pub async fn probe(cfg: &crate::config::AsrCfg, sample_rate: u32) -> Result<Stri
     let mut asr = DoubaoAsr::new(cfg.clone(), sample_rate);
     asr.connect().await?;
     let _ = tokio::time::timeout(Duration::from_secs(1), asr.close()).await;
-    Ok(format!("已完成模型初始化 ({})", cfg.resource_id))
+    Ok(format!(
+        "Model initialized (resource_id={})",
+        cfg.resource_id
+    ))
 }
 
 #[cfg(test)]

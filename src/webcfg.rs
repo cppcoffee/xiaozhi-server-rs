@@ -79,7 +79,7 @@ async fn save(
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
     if !same_origin(&headers) {
-        warn!("拒绝跨站 POST /config");
+        warn!("Rejected cross-origin POST /config");
         return render(StatusCode::FORBIDDEN, "", "跨站请求被拒绝");
     }
     let text = form.get("config").cloned().unwrap_or_default();
@@ -103,7 +103,7 @@ async fn save(
             &format!(r#"<p class="err">写入失败：{}</p>"#, escape(&e.to_string())),
         );
     }
-    info!("配置已通过网页更新：{}", state.path);
+    info!("Configuration saved through the web UI: {}", state.path);
     render(StatusCode::OK, &text, r#"<p class="ok">已保存。</p>"#)
 }
 

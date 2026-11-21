@@ -133,19 +133,21 @@ MCP 复用官方 Rust SDK `rmcp`（Apache-2.0），SSE 帧解析复用 `eventsou
 ## 6. 联调排查顺序
 
 1. `python3 tests/check_ws.py` 通过 → 协议层 OK
-2. 启动日志出现 `ASR 连接已建立` → 豆包 ASR 凭证 OK
-3. 日志出现 `ASR 识别: xxx` → 麦克风/Opus/VAD 链路 OK
-4. 日志出现 `用户: xxx` 且设备出声 → LLM + TTS 全链路 OK
+2. 日志出现 `ASR connection established` → 豆包 ASR 凭证 OK
+3. 日志出现 `ASR final transcript`（旧接口为 `ASR transcript`）→ 麦克风/Opus/VAD 链路 OK
+4. 日志出现 `User: ...` 且设备出声 → 问答和播报链路 OK
+
+终端和文件日志使用英文。识别文本、设备字段和外部错误中的非 ASCII 字符以 `\uXXXX` 转义输出，语音回复和协议数据保留原文。
 
 常见报错：
 
 | 日志 | 原因 |
 |---|---|
-| `Ark LLM 请求失败 401` | `llm.api_key` 错误或未开通模型 |
-| `Ark LLM 请求失败 404` / `model not found` | `llm.model` 换成方舟的推理接入点 ID（`ep-xxxxxxxx`） |
+| LLM 请求返回 `401 Unauthorized` | `llm.api_key` 错误或未开通模型 |
+| LLM 请求返回 `404 Not Found` / `model not found` | `llm.model` 换成方舟的推理接入点 ID（`ep-xxxxxxxx`） |
 | 语音接口返回 `401` / `45000010` | 核对 `speech.api_key` 和模型开通的语音项目 |
-| `ASR 初始化失败 ... 45000001` | 核对 ASR 资源 ID 及该资源的开通状态 |
-| `TTS 返回错误 code=...` | 核对 TTS 资源 ID、音色和项目权限，记录响应中的 LogID |
+| `ASR initialization failed` / `45000001` | 核对 ASR 资源 ID 及该资源的开通状态 |
+| `TTS returned error code=...` | 核对 TTS 资源 ID、音色和项目权限，记录响应中的 LogID |
 | 设备一直没反应 | VAD 门限过高（降低 `rms_threshold`），或设备 OTA 未指向本机 |
 
 ## 7. 已知取舍
