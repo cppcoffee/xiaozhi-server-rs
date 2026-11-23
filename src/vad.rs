@@ -10,9 +10,10 @@ pub enum VadEvent {
     EndSpeech(bool),
 }
 
-/// Pure energy-threshold VAD: replaces the local Silero model, so all-cloud deployments need no local inference
+/// Adaptive energy-threshold VAD with noise-floor tracking and start/continue hysteresis
 pub struct EnergyVad {
     threshold: f64,
+    noise_floor: f64,
     start_frames: u32,
     end_frames: u32,
     max_frames: u32,
@@ -28,6 +29,7 @@ impl EnergyVad {
         let max_frames = MAX_SPEECH_SECS * 1000 / frame_ms.max(1);
         Self {
             threshold: cfg.rms_threshold,
+            noise_floor: 0.0,
             start_frames: cfg.start_frames.max(1),
             end_frames: cfg.end_frames.max(1),
             max_frames,
@@ -42,6 +44,23 @@ impl EnergyVad {
         self.speaking
     }
 
+    fn start_threshold(&self) -> f64 {
+        self.threshold.max(self.noise_floor * 2.2)
+    }
+
+    fn continue_threshold(&self) -> f64 {
+        (self.start_threshold() * 0.65).max(self.noise_floor * 1.6)
+    }
+
+    pub fn is_voiced(&self, level: f64) -> bool {
+        let th = if self.speaking {
+            self.continue_threshold()
+        } else {
+            self.start_threshold()
+        };
+        level >= th
+    }
+
     #[allow(dead_code)]
     pub fn push(&mut self, pcm: &[i16]) -> VadEvent {
         self.push_with_rms(pcm).0
@@ -49,7 +68,7 @@ impl EnergyVad {
 
     pub fn push_with_rms(&mut self, pcm: &[i16]) -> (VadEvent, f64) {
         let level = rms(pcm);
-        let voiced = level >= self.threshold;
+        let voiced = self.is_voiced(level);
 
         if !self.speaking {
             if voiced {
@@ -62,6 +81,12 @@ impl EnergyVad {
                 }
             } else {
                 self.voiced = 0;
+                // Track quiet room floor so steady ambient noise (fan/AC) does not stall endpointing.
+                if self.noise_floor == 0.0 {
+                    self.noise_floor = level;
+                } else {
+                    self.noise_floor = self.noise_floor * 0.92 + level * 0.08;
+                }
             }
             return (VadEvent::None, level);
         }
@@ -112,6 +137,21 @@ mod tests {
             }
         }
         assert_eq!(last, VadEvent::EndSpeech(true));
+    }
+
+    #[test]
+    fn adapts_to_ambient_noise_floor_and_keeps_soft_tails() {
+        let mut vad = EnergyVad::new(&cfg(), 60);
+        for _ in 0..10 {
+            assert_eq!(vad.push(&[350; 960]), VadEvent::None);
+        }
+        // Mild spike above static 500 but below 2.2x 350 floor does not false-trigger.
+        assert_eq!(vad.push(&[550; 960]), VadEvent::None);
+        assert_eq!(vad.push(&[2000; 960]), VadEvent::StartSpeech);
+        // Softer trailing syllable (600 > continue_th ~560) stays voiced.
+        assert_eq!(vad.push(&[600; 960]), VadEvent::None);
+        // Dropping back to room floor ends speech cleanly.
+        assert_eq!(vad.push(&[350; 960]), VadEvent::EndSpeech(false));
     }
 }
 

@@ -68,11 +68,33 @@ jobs:
       - name: Generate SHA256 checksums
         working-directory: artifacts
         run: |
-          sha256sum *.tar.gz > SHA256SUMS.txt
-          for f in *.tar.gz; do
-            sha256sum "$f" > "$f.sha256"
+          : > SHA256SUMS.txt
+          : > RELEASE-MANIFEST.tsv
+          for archive in *.tar.gz; do
+            digest=$(sha256sum "$archive" | cut -d ' ' -f 1)
+            metadata=${archive#xiaozhi-server-rs-}
+            if [[ "$metadata" == *-x86_64-unknown-linux-gnu.tar.gz ]]; then
+              target=x86_64-unknown-linux-gnu
+              version=${metadata%-${target}.tar.gz}
+            else
+              target=aarch64-unknown-linux-gnu
+              version=${metadata%-${target}.tar.gz}
+            fi
+            mv "$archive" "$digest"
+            printf '%s  %s\n' "$digest" "$digest" >> SHA256SUMS.txt
+            printf '%s\t%s\t%s\n' "$version" "$target" "$digest" >> RELEASE-MANIFEST.tsv
           done
           {
+            echo "## SHA256-addressed release assets"
+            echo
+            echo "Assets are named by the SHA256 digest of their contents. The files contain gzip-compressed tar archives."
+            echo
+            echo "| Version | Target | SHA256 filename |"
+            echo "| --- | --- | --- |"
+            while IFS="$(printf '\t')" read -r version target digest; do
+              echo "| $version | $target | $digest |"
+            done < RELEASE-MANIFEST.tsv
+            echo
             echo "## SHA256 Checksums"
             echo '```'
             cat SHA256SUMS.txt
@@ -85,6 +107,6 @@ jobs:
           generate_release_notes: true
           body_path: release_body.md
           files: |
-            artifacts/*.tar.gz
-            artifacts/*.sha256
+            artifacts/[0-9a-f]*
             artifacts/SHA256SUMS.txt
+            artifacts/RELEASE-MANIFEST.tsv

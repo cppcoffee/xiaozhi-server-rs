@@ -13,9 +13,8 @@ use crate::vad::{EnergyVad, VadEvent};
 
 use super::Shared;
 
-/// Server-side silence fallback: if the device misses its local endpoint and never sends listen stop,
-/// this much consecutive silence after speech ends the turn and triggers recognition instead of waiting out the device's 15s timeout.
-const SERVER_SILENCE_FALLBACK_MS: u32 = 1200;
+/// Server-side silence fallback: ends a turn after natural end-of-speech pause (also drives followup & realtime mode).
+const SERVER_SILENCE_FALLBACK_MS: u32 = 780;
 
 const PRE_ROLL_FRAMES: usize = 3;
 
@@ -24,6 +23,7 @@ pub(super) struct InputState {
     vad: EnergyVad,
     pre_roll: VecDeque<Vec<i16>>,
     manual_mode: bool,
+    realtime_mode: bool,
     pub listening: bool,
     speech_started: bool,
     post_speech_silent_frames: u32,
@@ -39,6 +39,7 @@ impl InputState {
             vad: EnergyVad::new(&cfg.vad, crate::config::INPUT_FRAME_MS),
             pre_roll: VecDeque::with_capacity(PRE_ROLL_FRAMES),
             manual_mode: false,
+            realtime_mode: false,
             listening: false,
             speech_started: false,
             post_speech_silent_frames: 0,
@@ -57,12 +58,21 @@ impl InputState {
     fn finish_audio(
         &mut self,
         pcm: Vec<i16>,
+        shared: &Shared,
         asr_tx: &mpsc::Sender<AsrCmd>,
-        closed: &CancellationToken,
     ) {
-        self.stop_listening();
+        if self.realtime_mode {
+            // Keep uplink open across speaking/next-turn in realtime mode (AEC barge-in & multi-turn).
+            self.speech_started = false;
+            self.post_speech_silent_frames = 0;
+            self.pre_roll.clear();
+            self.vad = EnergyVad::new(&shared.cfg.vad, crate::config::INPUT_FRAME_MS);
+            self.input = None;
+        } else {
+            self.stop_listening();
+        }
         if asr_tx.try_send(AsrCmd::Pcm(pcm)).is_err() || asr_tx.try_send(AsrCmd::Flush).is_err() {
-            closed.cancel();
+            shared.closed.cancel();
         }
     }
 
@@ -120,6 +130,7 @@ impl InputState {
         let state = v["state"].as_str().unwrap_or("");
         if let Some(mode) = v["mode"].as_str() {
             self.manual_mode = mode == "manual";
+            self.realtime_mode = mode == "realtime";
         }
         match state {
             "start" => {
@@ -173,7 +184,12 @@ impl InputState {
         }
     }
 
-    pub fn handle_audio(&mut self, bytes: &[u8], shared: &Shared, asr_tx: &mpsc::Sender<AsrCmd>) {
+    pub async fn handle_audio(
+        &mut self,
+        bytes: &[u8],
+        shared: &Shared,
+        asr_tx: &mpsc::Sender<AsrCmd>,
+    ) {
         let pcm = match self.decoder.decode(bytes) {
             Ok(p) => p.to_vec(),
             Err(e) => {
@@ -181,6 +197,10 @@ impl InputState {
                 return;
             }
         };
+        self.handle_pcm(pcm, shared, asr_tx).await;
+    }
+
+    async fn handle_pcm(&mut self, pcm: Vec<i16>, shared: &Shared, asr_tx: &mpsc::Sender<AsrCmd>) {
         self.received_frames += 1;
         let (event, level) = self.vad.push_with_rms(&pcm);
         self.peak_rms = self.peak_rms.max(level);
@@ -192,6 +212,15 @@ impl InputState {
                 self.post_speech_silent_frames = 0;
                 if !self.speech_started {
                     info!("Speech detected");
+                    if self.realtime_mode && self.input.is_none() {
+                        shared.abort_turn(None).await;
+                        let turn = CancellationToken::new();
+                        if asr_tx.try_send(AsrCmd::Start(turn.clone())).is_err() {
+                            shared.closed.cancel();
+                            return;
+                        }
+                        self.input = Some(turn);
+                    }
                     self.speech_started = true;
                     if self
                         .pre_roll
@@ -206,7 +235,7 @@ impl InputState {
                 }
             }
             VadEvent::None if self.speech_started || self.vad.is_speaking() => {
-                if level >= shared.cfg.vad.rms_threshold {
+                if self.vad.is_voiced(level) {
                     self.post_speech_silent_frames = 0;
                 } else {
                     self.post_speech_silent_frames += 1;
@@ -216,7 +245,7 @@ impl InputState {
                         "Ending input after {} ms of post-speech silence",
                         self.post_speech_silent_frames * crate::config::INPUT_FRAME_MS
                     );
-                    self.finish_audio(pcm, asr_tx, &shared.closed);
+                    self.finish_audio(pcm, shared, asr_tx);
                     return;
                 }
                 if asr_tx.try_send(AsrCmd::Pcm(pcm)).is_err() {
@@ -231,7 +260,7 @@ impl InputState {
             }
             VadEvent::EndSpeech(capped) => {
                 // On a short pause prefer the device's local listen stop while still forwarding the tail to ASR;
-                // past the server silence fallback (1.2s default) or the 20s recording cap, the server ends the turn itself.
+                // past the server silence fallback (780ms default) or the 20s recording cap, the server ends the turn itself.
                 if !capped {
                     self.post_speech_silent_frames += 1;
                     if !self.manual_mode && self.post_speech_silent_frames >= fallback_frames {
@@ -239,7 +268,7 @@ impl InputState {
                             "Ending input after {} ms of post-speech silence",
                             self.post_speech_silent_frames * crate::config::INPUT_FRAME_MS
                         );
-                        self.finish_audio(pcm, asr_tx, &shared.closed);
+                        self.finish_audio(pcm, shared, asr_tx);
                         return;
                     }
                     debug!("Pause detected. Forwarding audio while waiting for the device to stop listening.");
@@ -249,8 +278,83 @@ impl InputState {
                     return;
                 }
                 info!("Ending input at the recording duration limit");
-                self.finish_audio(pcm, asr_tx, &shared.closed);
+                self.finish_audio(pcm, shared, asr_tx);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn test_shared(cfg: Arc<Config>) -> (Shared, mpsc::Receiver<axum::extract::ws::Message>) {
+        let (ws_tx, ws_rx) = mpsc::channel(16);
+        let (audio_tx, _audio_rx) = mpsc::channel(4);
+        let closed = CancellationToken::new();
+        let mcp = crate::mcp::DeviceMcp::new("sid".into(), ws_tx.clone(), closed.clone());
+        (
+            Shared {
+                cfg,
+                mcp,
+                closed,
+                ws_tx,
+                audio_tx,
+                session_id: "sid".into(),
+                device_id: "dev".into(),
+                history: Mutex::new(Vec::new()),
+                turn_cancel: Mutex::new(None),
+            },
+            ws_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn realtime_mode_stays_listening_and_aborts_active_turn_on_barge_in() {
+        let cfg = Arc::new(Config::parse(include_str!("../../config.example.toml")).unwrap());
+        let (shared, mut ws_rx) = test_shared(cfg.clone());
+        let (asr_tx, mut asr_rx) = mpsc::channel(64);
+        let (manual_tx, _manual_rx) = mpsc::channel(4);
+        let mut input = InputState::new(&cfg).unwrap();
+        let sr = AtomicU32::new(16_000);
+
+        input
+            .handle_text(
+                r#"{"type":"listen","state":"start","mode":"realtime"}"#,
+                &shared,
+                &sr,
+                &asr_tx,
+                &manual_tx,
+            )
+            .await;
+        assert!(matches!(asr_rx.try_recv(), Ok(AsrCmd::Start(_))));
+
+        // Turn 1 speech + silence fallback ends input while keeping listening=true.
+        for _ in 0..3 {
+            input.handle_pcm(vec![2000; 960], &shared, &asr_tx).await;
+        }
+        for _ in 0..14 {
+            input.handle_pcm(vec![0; 960], &shared, &asr_tx).await;
+        }
+        let mut saw_flush = false;
+        while let Ok(cmd) = asr_rx.try_recv() {
+            if matches!(cmd, AsrCmd::Flush) {
+                saw_flush = true;
+            }
+        }
+        assert!(saw_flush);
+        assert!(input.listening);
+
+        // Simulate active TTS playback, then user barges in without sending listen:start.
+        let speaking_turn = CancellationToken::new();
+        *shared.turn_cancel.lock().await = Some(speaking_turn.clone());
+        for _ in 0..2 {
+            input.handle_pcm(vec![2000; 960], &shared, &asr_tx).await;
+        }
+        assert!(speaking_turn.is_cancelled());
+        assert!(matches!(asr_rx.try_recv(), Ok(AsrCmd::Start(_))));
+        assert!(ws_rx.try_recv().is_ok()); // tts:stop sent on abort
     }
 }

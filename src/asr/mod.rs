@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::config::AsrCfg;
@@ -224,6 +224,10 @@ async fn drain_pending(asr: &mut DoubaoAsr, wait_ms: u64) -> Result<Option<Strin
                         "ASR recognition failed with code={code}"
                     );
                 }
+                if asr.preconnected {
+                    asr.preconnected = false;
+                    asr.replay_pcm.clear();
+                }
                 if modern {
                     if let Some(confirmed) = extract_text(&value) {
                         asr.confirmed_text = Some(confirmed);
@@ -267,6 +271,7 @@ pub async fn run_asr(
     let mut asr = DoubaoAsr::new(cfg, sample_rate);
     let mut active: Option<CancellationToken> = None;
     loop {
+        let idle_watch = !asr.has_pcm && asr.ws.is_some();
         let cmd = tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
@@ -278,6 +283,11 @@ pub async fn run_asr(
             } => {
                 asr.reset();
                 active = None;
+                continue;
+            }
+            _ = asr.wait_idle_close(), if idle_watch => {
+                debug!("Preconnected ASR socket closed while idle; will reconnect on speech");
+                asr.reset();
                 continue;
             }
             cmd = rx.recv() => match cmd { Some(cmd) => cmd, None => break },
@@ -295,9 +305,12 @@ pub async fn run_asr(
                     active = None;
                 }
                 res = asr.connect() => {
-                    if let Err(e) = res {
-                        debug!("ASR preconnect failed. Retrying on the first audio packet: {e:#}");
-                        asr.reset();
+                    match res {
+                        Ok(()) => asr.preconnected = true,
+                        Err(e) => {
+                            debug!("ASR preconnect failed. Retrying on the first audio packet: {e:#}");
+                            asr.reset();
+                        }
                     }
                 }
             }
@@ -330,37 +343,66 @@ pub async fn run_asr(
     }
 }
 
+async fn replay_preconnected(asr: &mut DoubaoAsr, replay: &[i16]) -> Result<()> {
+    debug!(
+        samples = replay.len(),
+        "Preconnected ASR expired; reconnecting and replaying initial audio"
+    );
+    asr.reset();
+    asr.connect().await?;
+    asr.send_pcm(replay).await
+}
+
+async fn send_pcm_and_drain(asr: &mut DoubaoAsr, pcm: &[i16]) -> Result<Option<String>> {
+    let attempt = match asr.send_pcm(pcm).await {
+        Ok(()) => drain_pending(asr, 0).await,
+        Err(e) => Err(e),
+    };
+    let expired = matches!(&attempt, Err(_)) || (matches!(&attempt, Ok(None)) && asr.ws.is_none());
+    if expired && asr.preconnected && !asr.replay_pcm.is_empty() {
+        let replay = std::mem::take(&mut asr.replay_pcm);
+        replay_preconnected(asr, &replay).await?;
+        return drain_pending(asr, 0).await;
+    }
+    attempt
+}
+
+async fn flush_and_wait(asr: &mut DoubaoAsr) -> Result<Option<String>> {
+    let started = tokio::time::Instant::now();
+    asr.flush().await?;
+    for _ in 0..FLUSH_WAIT_STEPS {
+        if let Some(text) = drain_pending(asr, 100).await? {
+            debug!(
+                elapsed_ms = started.elapsed().as_millis(),
+                "ASR flush to final"
+            );
+            return Ok(Some(text));
+        }
+        if asr.ws.is_none() {
+            break;
+        }
+    }
+    // Complete a silent or failed input so the device can leave listening.
+    Ok(Some(String::new()))
+}
+
 async fn read_result(asr: &mut DoubaoAsr, cmd: AsrCmd) -> Option<String> {
     let result = match cmd {
-        AsrCmd::Pcm(pcm) => {
-            if let Err(e) = asr.send_pcm(&pcm).await {
-                error!("Failed to send audio to ASR: {e:#}");
-                asr.reset();
-                return asr.cfg.speech_api_key.as_ref().map(|_| String::new());
-            }
-            drain_pending(asr, 0).await
-        }
+        AsrCmd::Pcm(pcm) => send_pcm_and_drain(asr, &pcm).await,
         AsrCmd::Flush if !asr.has_pcm => Ok(Some(String::new())),
         AsrCmd::Flush => {
-            async {
-                let started = tokio::time::Instant::now();
-                asr.flush().await?;
-                for _ in 0..FLUSH_WAIT_STEPS {
-                    if let Some(text) = drain_pending(asr, 100).await? {
-                        debug!(
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "ASR flush to final"
-                        );
-                        return Ok(Some(text));
-                    }
-                    if asr.ws.is_none() {
-                        break;
-                    }
+            let attempt = flush_and_wait(asr).await;
+            let expired = matches!(&attempt, Err(_))
+                || (matches!(&attempt, Ok(Some(t)) if t.is_empty()) && asr.ws.is_none());
+            if expired && asr.preconnected && !asr.replay_pcm.is_empty() {
+                let replay = std::mem::take(&mut asr.replay_pcm);
+                match replay_preconnected(asr, &replay).await {
+                    Ok(()) => flush_and_wait(asr).await,
+                    Err(e) => Err(e),
                 }
-                // Complete a silent or failed input so the device can leave listening.
-                Ok(Some(String::new()))
+            } else {
+                attempt
             }
-            .await
         }
         AsrCmd::Start(_) => unreachable!("start is handled by the ASR worker"),
     };
@@ -525,6 +567,170 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result.text, "现在几点了？");
+        cancel.cancel();
+        worker.await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preconnected_idle_timeout_reconnects_and_transcribes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // 1st connection: accept init, then send Doubao idle timeout error 45000081.
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws1 = tokio_tungstenite::accept_async(socket).await.unwrap();
+            assert!(matches!(ws1.next().await, Some(Ok(Message::Binary(_)))));
+            ws1.send(Message::Binary(
+                frame(9, false, Some(1), br#"{"code":20000000}"#)
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            let mut err_frame = vec![0x11, 0xf0, 0x10, 0x00];
+            err_frame.extend_from_slice(&45_000_081u32.to_be_bytes());
+            let body = br#"{"error":"Timed out waiting for the next audio packet."}"#;
+            err_frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            err_frame.extend_from_slice(body);
+            ws1.send(Message::Binary(err_frame.into())).await.unwrap();
+            let _ = ws1.close(None).await;
+
+            // 2nd connection: receive replayed/fresh audio and return final text.
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws2 = tokio_tungstenite::accept_async(socket).await.unwrap();
+            assert!(matches!(ws2.next().await, Some(Ok(Message::Binary(_)))));
+            ws2.send(Message::Binary(
+                frame(9, false, Some(1), br#"{"code":20000000}"#)
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            while let Some(Ok(Message::Binary(data))) = ws2.next().await {
+                if data.len() >= 2 && (data[1] & FLAG_LAST) != 0 {
+                    let result = json!({"code":20000000,"result":{"text":"现在几点了？"}});
+                    ws2.send(Message::Binary(
+                        frame(9, true, Some(2), &serde_json::to_vec(&result).unwrap())
+                            .unwrap()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                    break;
+                }
+            }
+        });
+
+        let mut cfg = crate::config::Config::parse(include_str!("../../config.example.toml"))
+            .unwrap()
+            .asr;
+        cfg.speech_api_key = Some("test-voice-key".into());
+        cfg.ws_url = format!("ws://{address}");
+        let (tx, rx) = mpsc::channel(8);
+        let (out, mut results) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(run_asr(cfg, 16_000, rx, out, cancel.clone()));
+        tx.send(AsrCmd::Start(CancellationToken::new()))
+            .await
+            .unwrap();
+        // Give the idle watcher time to observe 45000081 before speech arrives.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..3 {
+            tx.send(AsrCmd::Pcm(vec![800; 960])).await.unwrap();
+        }
+        tx.send(AsrCmd::Flush).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), results.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.text, "现在几点了？");
+        cancel.cancel();
+        worker.await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preconnected_expiry_mid_initial_audio_replays_buffered_pcm() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // 1st connection: accept init, then reply with 45000081 once audio hits the wire.
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws1 = tokio_tungstenite::accept_async(socket).await.unwrap();
+            assert!(matches!(ws1.next().await, Some(Ok(Message::Binary(_)))));
+            ws1.send(Message::Binary(
+                frame(9, false, Some(1), br#"{"code":20000000}"#)
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            // Wait for the first audio packet, simulate WAN RTT, then return 45000081.
+            assert!(matches!(ws1.next().await, Some(Ok(Message::Binary(_)))));
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let mut err_frame = vec![0x11, 0xf0, 0x10, 0x00];
+            err_frame.extend_from_slice(&45_000_081u32.to_be_bytes());
+            let body = br#"{"error":"Timed out waiting for the next audio packet."}"#;
+            err_frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            err_frame.extend_from_slice(body);
+            ws1.send(Message::Binary(err_frame.into())).await.unwrap();
+            let _ = ws1.close(None).await;
+
+            // 2nd connection: verify all 3 frames (3 * 1920 = 5760 bytes) are replayed cleanly.
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws2 = tokio_tungstenite::accept_async(socket).await.unwrap();
+            assert!(matches!(ws2.next().await, Some(Ok(Message::Binary(_)))));
+            ws2.send(Message::Binary(
+                frame(9, false, Some(1), br#"{"code":20000000}"#)
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            let mut total_pcm = 0usize;
+            while let Some(Ok(Message::Binary(data))) = ws2.next().await {
+                let pcm = gunzip(&data[12..]).unwrap();
+                total_pcm += pcm.len();
+                if data.len() >= 2 && (data[1] & FLAG_LAST) != 0 {
+                    assert_eq!(total_pcm, 3 * 960 * 2);
+                    let result = json!({"code":20000000,"result":{"text":"重放成功"}});
+                    ws2.send(Message::Binary(
+                        frame(9, true, Some(3), &serde_json::to_vec(&result).unwrap())
+                            .unwrap()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                    break;
+                }
+            }
+        });
+
+        let mut cfg = crate::config::Config::parse(include_str!("../../config.example.toml"))
+            .unwrap()
+            .asr;
+        cfg.speech_api_key = Some("test-voice-key".into());
+        cfg.ws_url = format!("ws://{address}");
+        let (tx, rx) = mpsc::channel(8);
+        let (out, mut results) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(run_asr(cfg, 16_000, rx, out, cancel.clone()));
+        tx.send(AsrCmd::Start(CancellationToken::new()))
+            .await
+            .unwrap();
+        // Send 3 frames (3rd frame hits wire and triggers 45000081 from mock server).
+        for _ in 0..3 {
+            tx.send(AsrCmd::Pcm(vec![800; 960])).await.unwrap();
+        }
+        // Let the error arrive on ws1 before Flush, or let 4th frame / Flush observe it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(AsrCmd::Flush).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), results.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.text, "重放成功");
         cancel.cancel();
         worker.await.unwrap();
         server.await.unwrap();

@@ -14,8 +14,8 @@ use crate::tts::DoubaoTts;
 use super::turn::TurnBudget;
 use super::Shared;
 
-/// Playback start pre-buffer frames: send the first 2 frames (120ms) back-to-back to build the ESP32 jitter buffer
-const PRE_BUFFER_FRAMES: usize = 2;
+/// Playback start pre-buffer frames: send the first 3 frames (180ms) back-to-back to cushion ESP32 Wi-Fi jitter
+const PRE_BUFFER_FRAMES: usize = 3;
 pub(super) const OUTPUT_FRAME_MS: u32 = 60;
 const OUTPUT_FRAME_INTERVAL: Duration = Duration::from_millis(OUTPUT_FRAME_MS as u64);
 

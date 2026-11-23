@@ -17,9 +17,14 @@ use crate::config::Config;
 use crate::mcp::DeviceMcp;
 use crate::tts::DoubaoTts;
 
+use super::audio::speak_single_sentence;
 use super::input::InputState;
-use super::turn::run_turn_with_rate;
+use super::turn::{run_turn_with_rate, TurnBudget};
 use super::{AudioFrame, Shared};
+
+const GOODBYE_REPLY: &str = "好的，有需要再叫我。";
+const GOODBYE_TTS_TIMEOUT: Duration = Duration::from_secs(4);
+const GOODBYE_DRAIN_MARGIN: Duration = Duration::from_millis(250);
 
 /// Close the connection after this long without any message (an idle device only sends on wake)
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -112,7 +117,7 @@ pub async fn handle_connection(sock: WebSocket, cfg: Arc<Config>, device_id: Str
                     .await;
             }
             Message::Binary(b) if input_state.listening => {
-                input_state.handle_audio(&b, &shared, &asr_tx);
+                input_state.handle_audio(&b, &shared, &asr_tx).await;
             }
             Message::Close(_) => break,
             _ => {}
@@ -188,20 +193,53 @@ fn spawn_brain(
             };
             let AsrOutcome { turn, text } = outcome;
             if text.trim().is_empty() || crate::text::is_exit(&text) {
-                let _guard = shared.turn_cancel.lock().await;
-                if turn.is_cancelled() {
-                    continue;
-                }
-                turn.cancel();
-                if text.trim().is_empty() {
-                    shared.send_tts_state("start", None).await;
-                    shared.send_tts_state("stop", None).await;
-                    continue;
+                {
+                    let mut cur = shared.turn_cancel.lock().await;
+                    if turn.is_cancelled() || shared.closed.is_cancelled() {
+                        continue;
+                    }
+                    if text.trim().is_empty() {
+                        turn.cancel();
+                        shared.send_tts_state("start", None).await;
+                        shared.send_tts_state("stop", None).await;
+                        continue;
+                    }
+                    *cur = Some(turn.clone());
                 }
                 info!("[{}] User ended the session: {text}", shared.device_id);
                 shared
                     .send_json(crate::protocol::stt_text(&text, &shared.session_id))
                     .await;
+                shared.send_tts_state("start", None).await;
+                shared
+                    .send_tts_state("sentence_start", Some(GOODBYE_REPLY))
+                    .await;
+                let output_sr = tts.preferred_sample_rate(negotiated_sr.load(Ordering::Relaxed));
+                let budget = TurnBudget::new();
+                let spoke = tokio::select! {
+                    biased;
+                    _ = turn.cancelled() => false,
+                    _ = shared.closed.cancelled() => false,
+                    res = tokio::time::timeout(
+                        GOODBYE_TTS_TIMEOUT,
+                        speak_single_sentence(&shared, &tts, GOODBYE_REPLY, &turn, &budget, output_sr),
+                    ) => matches!(res, Ok(Ok(()))),
+                };
+                {
+                    let mut cur = shared.turn_cancel.lock().await;
+                    if !turn.is_cancelled() && !shared.closed.is_cancelled() {
+                        *cur = None;
+                        shared.send_tts_state("stop", None).await;
+                    }
+                }
+                turn.cancel();
+                if spoke && !shared.closed.is_cancelled() {
+                    // Let the device finish its DMA tail before goodbye triggers VOICE_BIT_HANGUP.
+                    tokio::select! {
+                        _ = shared.closed.cancelled() => {},
+                        _ = tokio::time::sleep(GOODBYE_DRAIN_MARGIN) => {},
+                    }
+                }
                 shared
                     .send_json(json!({"type": "goodbye", "session_id": shared.session_id}))
                     .await;

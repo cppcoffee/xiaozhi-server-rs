@@ -1,11 +1,49 @@
 /// Text processing: streaming sentence splitting + cleanup before TTS
 use tracing::warn;
 
-/// Phrases where the user ends the session (whole-sentence match, punctuation ignored)
+/// Phrases where the user ends the session (matches final clause with common spoken lead-ins)
 pub fn is_exit(text: &str) -> bool {
-    const EXIT: [&str; 4] = ["退下", "退下吧", "再见", "拜拜"];
-    let t = text.trim().trim_end_matches(['。', '！', '？', '!', '?', '.', '，', ',', ' ']);
-    EXIT.contains(&t)
+    const SEP: [char; 12] = [
+        '。', '！', '？', '!', '?', '.', '，', ',', '、', ' ', '～', '~',
+    ];
+    const LEAD: [&str; 13] = [
+        "好的",
+        "好了",
+        "行了",
+        "没事了",
+        "可以",
+        "那就",
+        "那",
+        "好",
+        "行",
+        "嗯",
+        "哦",
+        "你",
+        "先",
+    ];
+    const EXIT: [&str; 9] = [
+        "退下",
+        "退下吧",
+        "退下了",
+        "再见",
+        "再见吧",
+        "再见了",
+        "拜拜",
+        "拜拜啦",
+        "拜拜了",
+    ];
+    let Some(mut tail) = text.split(SEP).rev().find(|s| !s.is_empty()) else {
+        return false;
+    };
+    loop {
+        if EXIT.contains(&tail) {
+            return true;
+        }
+        let Some(rest) = LEAD.iter().find_map(|p| tail.strip_prefix(p)) else {
+            return false;
+        };
+        tail = rest;
+    }
 }
 
 /// Split on Chinese punctuation so text can be synthesized while it is generated
@@ -121,7 +159,15 @@ mod tests {
         assert!(is_exit("退下"));
         assert!(is_exit(" 再见。 "));
         assert!(is_exit("拜拜！"));
+        assert!(is_exit("好了，你退下吧。"));
+        assert!(is_exit("好，那你退下吧。"));
+        assert!(is_exit("反正就是一张卷子，哦，你退下吧。"));
+        assert!(is_exit("没事了，你可以退下了"));
+        assert!(is_exit("好的再见"));
+        assert!(!is_exit("不要退下"));
+        assert!(!is_exit("别退下"));
         assert!(!is_exit("再见一次"));
+        assert!(!is_exit("明天再见"));
         assert!(!is_exit("今天天气怎么样"));
     }
 

@@ -17,6 +17,8 @@ use super::{
 pub(super) type AsrSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+pub(super) const MAX_REPLAY_SAMPLES: usize = 16_000 * 2;
+
 /// ASR long connection: lazy connect, stream audio, yield final text
 pub struct DoubaoAsr {
     pub(super) cfg: AsrCfg,
@@ -25,6 +27,8 @@ pub struct DoubaoAsr {
     next_sequence: Option<i32>,
     pending_pcm: Vec<u8>,
     pub(super) has_pcm: bool,
+    pub(super) preconnected: bool,
+    pub(super) replay_pcm: Vec<i16>,
     pub(super) confirmed_text: Option<String>,
 }
 
@@ -37,6 +41,8 @@ impl DoubaoAsr {
             next_sequence: None,
             pending_pcm: Vec::new(),
             has_pcm: false,
+            preconnected: false,
+            replay_pcm: Vec::new(),
             confirmed_text: None,
         }
     }
@@ -131,6 +137,14 @@ impl DoubaoAsr {
         if self.ws.is_none() {
             self.connect().await?;
         }
+        if self.preconnected {
+            if self.replay_pcm.len() + pcm.len() <= MAX_REPLAY_SAMPLES {
+                self.replay_pcm.extend_from_slice(pcm);
+            } else {
+                self.preconnected = false;
+                self.replay_pcm.clear();
+            }
+        }
         let bytes = pcm.iter().flat_map(|s| s.to_le_bytes());
         if self.cfg.speech_api_key.is_some() {
             self.pending_pcm.extend(bytes);
@@ -158,6 +172,32 @@ impl DoubaoAsr {
         Ok(())
     }
 
+    /// Watch an idle preconnected socket so server idle-timeouts drop cleanly before speech starts.
+    pub(super) async fn wait_idle_close(&mut self) {
+        let modern = self.cfg.speech_api_key.is_some();
+        let Some(ws) = self.ws.as_mut() else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        while let Some(msg) = ws.next().await {
+            match msg {
+                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+                Ok(Message::Binary(bytes)) => match parse_frame(&bytes, !modern) {
+                    Ok((value, last)) => {
+                        let ok = value["code"]
+                            .as_i64()
+                            .is_none_or(|c| matches!(c, 0 | 1000 | 1013 | 20_000_000));
+                        if !ok || last {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                },
+                _ => return,
+            }
+        }
+    }
+
     pub(super) async fn flush(&mut self) -> Result<()> {
         let pending = std::mem::take(&mut self.pending_pcm);
         self.send_audio(&pending, true).await
@@ -167,6 +207,8 @@ impl DoubaoAsr {
         self.ws = None;
         self.pending_pcm.clear();
         self.has_pcm = false;
+        self.preconnected = false;
+        self.replay_pcm.clear();
         self.confirmed_text = None;
         self.next_sequence = None;
     }

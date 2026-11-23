@@ -40,7 +40,7 @@ pub(super) struct TurnBudget {
 }
 
 impl TurnBudget {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let started = Instant::now();
         Self {
             started,
